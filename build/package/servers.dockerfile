@@ -5,6 +5,11 @@ WORKDIR /hatchet
 
 ENV CGO_ENABLED=0
 
+# Optional Go module proxy override for networks that cannot reach
+# proxy.golang.org directly (for example, builds behind a regional mirror).
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
+
 RUN apk update && apk add --no-cache git protoc protobuf-dev
 
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
