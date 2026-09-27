@@ -322,6 +322,11 @@ func runV0Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.
 			retention.WithPartition(p),
 			retention.WithDataRetention(sc.EnableDataRetention),
 			retention.WithWorkerRetention(sc.EnableWorkerRetention),
+			retention.WithSoftDeleteTenantReap(
+				sc.EnableSoftDeleteTenantReap,
+				softDeleteTenantReapGrace(sc.SoftDeleteTenantReapGracePeriod),
+				sc.SoftDeleteTenantReapInterval,
+			),
 		)
 
 		if err != nil {
@@ -621,6 +626,11 @@ func runV1Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.
 			retention.WithPartition(p),
 			retention.WithDataRetention(sc.EnableDataRetention),
 			retention.WithWorkerRetention(sc.EnableWorkerRetention),
+			retention.WithSoftDeleteTenantReap(
+				sc.EnableSoftDeleteTenantReap,
+				softDeleteTenantReapGrace(sc.SoftDeleteTenantReapGracePeriod),
+				sc.SoftDeleteTenantReapInterval,
+			),
 		)
 
 		if err != nil {
@@ -1037,4 +1047,17 @@ func isControllerActive(pausedControllers map[string]bool, controllerName Contro
 	}
 
 	return false
+}
+
+// softDeleteTenantReapGrace parses the soft-delete tenant reap grace period
+// configuration. A missing or unparsable value falls back to the default
+// 30-day undo window.
+func softDeleteTenantReapGrace(configured string) time.Duration {
+	const defaultGrace = 720 * time.Hour
+
+	if d, err := time.ParseDuration(configured); err == nil && d > 0 {
+		return d
+	}
+
+	return defaultGrace
 }

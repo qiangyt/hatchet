@@ -949,13 +949,18 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 		AdditionalLoggers:      cf.AdditionalLoggers,
 		EnableDataRetention:    cf.EnableDataRetention,
 		EnableWorkerRetention:  cf.EnableWorkerRetention,
-		SchedulingPoolV1:       schedulingPoolV1,
-		Version:                version,
-		Sampling:               cf.Sampling,
-		Operations:             cf.OLAP,
-		CronOperations:         cf.CronOperations,
-		OLAPStatusUpdates:      cf.OLAPStatusUpdates,
-		MQMaxDeathCount:        cf.MessageQueue.RabbitMQ.MaxDeathCount,
+
+		EnableSoftDeleteTenantReap:      cf.EnableSoftDeleteTenantReap,
+		SoftDeleteTenantReapGracePeriod: cf.SoftDeleteTenantReapGracePeriod,
+		SoftDeleteTenantReapInterval:    cf.SoftDeleteTenantReapInterval,
+
+		SchedulingPoolV1:  schedulingPoolV1,
+		Version:           version,
+		Sampling:          cf.Sampling,
+		Operations:        cf.OLAP,
+		CronOperations:    cf.CronOperations,
+		OLAPStatusUpdates: cf.OLAPStatusUpdates,
+		MQMaxDeathCount:   cf.MessageQueue.RabbitMQ.MaxDeathCount,
 	}, nil
 }
 

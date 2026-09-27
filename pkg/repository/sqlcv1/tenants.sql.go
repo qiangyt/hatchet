@@ -908,6 +908,76 @@ func (q *Queries) GetTenantWorkflowQueueMetrics(ctx context.Context, db DBTX, ar
 	return items, nil
 }
 
+const hardDeleteTenant = `-- name: HardDeleteTenant :execrows
+DELETE FROM "Tenant"
+WHERE "id" = $1::uuid
+`
+
+func (q *Queries) HardDeleteTenant(ctx context.Context, db DBTX, id uuid.UUID) (int64, error) {
+	result, err := db.Exec(ctx, hardDeleteTenant, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listSoftDeletedTenantsBefore = `-- name: ListSoftDeletedTenantsBefore :many
+SELECT
+    id, "createdAt", "updatedAt", "deletedAt", version, "uiVersion", name, slug, "analyticsOptOut", "alertMemberEmails", "controllerPartitionId", "workerPartitionId", "dataRetentionPeriod", "schedulerPartitionId", "canUpgradeV1", "onboardingData", environment
+FROM
+    "Tenant" as tenants
+WHERE
+    "deletedAt" IS NOT NULL AND
+    "deletedAt" < $1::timestamptz
+ORDER BY
+    "deletedAt" ASC
+LIMIT
+    $2::int
+`
+
+type ListSoftDeletedTenantsBeforeParams struct {
+	Before   pgtype.Timestamptz `json:"before"`
+	MaxCount int32              `json:"maxCount"`
+}
+
+func (q *Queries) ListSoftDeletedTenantsBefore(ctx context.Context, db DBTX, arg ListSoftDeletedTenantsBeforeParams) ([]*Tenant, error) {
+	rows, err := db.Query(ctx, listSoftDeletedTenantsBefore, arg.Before, arg.MaxCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*Tenant
+	for rows.Next() {
+		var i Tenant
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.Version,
+			&i.UiVersion,
+			&i.Name,
+			&i.Slug,
+			&i.AnalyticsOptOut,
+			&i.AlertMemberEmails,
+			&i.ControllerPartitionId,
+			&i.WorkerPartitionId,
+			&i.DataRetentionPeriod,
+			&i.SchedulerPartitionId,
+			&i.CanUpgradeV1,
+			&i.OnboardingData,
+			&i.Environment,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTenantAlertGroups = `-- name: ListTenantAlertGroups :many
 SELECT
     id, "createdAt", "updatedAt", "deletedAt", "tenantId", emails
@@ -1256,6 +1326,8 @@ tenants_to_update AS (
     FROM
         "Tenant" AS tenants
     -- For the controller partition, we DO use the internal tenant as well
+    WHERE
+        tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -1292,6 +1364,7 @@ tenants_to_update AS (
         "Tenant" AS tenants
     WHERE
         tenants."slug" != 'internal'
+        AND tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -1328,6 +1401,7 @@ tenants_to_update AS (
         "Tenant" AS tenants
     WHERE
         tenants."slug" != 'internal'
+        AND tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -1369,8 +1443,11 @@ WITH active_partitions AS (
     FROM
         "Tenant" AS tenants
     WHERE
-        "controllerPartitionId" IS NULL OR
-        "controllerPartitionId" IN (SELECT "id" FROM inactive_partitions)
+        (
+            "controllerPartitionId" IS NULL OR
+            "controllerPartitionId" IN (SELECT "id" FROM inactive_partitions)
+        )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "controllerPartitionId" = partitions."id"
@@ -1418,6 +1495,7 @@ WITH active_partitions AS (
             "schedulerPartitionId" IS NULL OR
             "schedulerPartitionId" IN (SELECT "id" FROM inactive_partitions)
         )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "schedulerPartitionId" = partitions."id"
@@ -1465,6 +1543,7 @@ WITH active_partitions AS (
             "workerPartitionId" IS NULL OR
             "workerPartitionId" IN (SELECT "id" FROM inactive_partitions)
         )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "workerPartitionId" = partitions."id"

@@ -32,6 +32,10 @@ type RetentionControllerImpl struct {
 	workerRetention      bool
 	queueRetention       bool
 	userSessionRetention bool
+
+	softDeleteTenantReap         bool
+	softDeleteTenantReapGrace    time.Duration
+	softDeleteTenantReapInterval string
 }
 
 type RetentionControllerOpt func(*RetentionControllerOpts)
@@ -47,6 +51,10 @@ type RetentionControllerOpts struct {
 	workerRetention      bool
 	queueRetention       bool
 	userSessionRetention bool
+
+	softDeleteTenantReap         bool
+	softDeleteTenantReapGrace    time.Duration
+	softDeleteTenantReapInterval string
 }
 
 func defaultRetentionControllerOpts() *RetentionControllerOpts {
@@ -112,6 +120,18 @@ func WithWorkerRetention(b bool) RetentionControllerOpt {
 	}
 }
 
+// WithSoftDeleteTenantReap enables the periodic hard deletion of
+// soft-deleted tenants whose grace period has elapsed. grace is the undo
+// window after a soft delete before the tenant's rows are physically
+// removed; interval is how often the reap pass runs (a Go duration string).
+func WithSoftDeleteTenantReap(enabled bool, grace time.Duration, interval string) RetentionControllerOpt {
+	return func(opts *RetentionControllerOpts) {
+		opts.softDeleteTenantReap = enabled
+		opts.softDeleteTenantReapGrace = grace
+		opts.softDeleteTenantReapInterval = interval
+	}
+}
+
 func New(fs ...RetentionControllerOpt) (*RetentionControllerImpl, error) {
 	opts := defaultRetentionControllerOpts()
 
@@ -155,6 +175,10 @@ func New(fs ...RetentionControllerOpt) (*RetentionControllerImpl, error) {
 		workerRetention:      opts.workerRetention,
 		queueRetention:       opts.queueRetention,
 		userSessionRetention: opts.userSessionRetention,
+
+		softDeleteTenantReap:         opts.softDeleteTenantReap,
+		softDeleteTenantReapGrace:    opts.softDeleteTenantReapGrace,
+		softDeleteTenantReapInterval: opts.softDeleteTenantReapInterval,
 	}, nil
 }
 
@@ -212,6 +236,25 @@ func (rc *RetentionControllerImpl) Start() (func() error, error) {
 
 		if err != nil {
 			return nil, fmt.Errorf("could not set up runCleanupUserSessions: %w", err)
+		}
+	}
+
+	if rc.softDeleteTenantReap {
+		reapInterval, err := time.ParseDuration(rc.softDeleteTenantReapInterval)
+		if err != nil {
+			return nil, fmt.Errorf("invalid soft-delete tenant reap interval %q: %w", rc.softDeleteTenantReapInterval, err)
+		}
+
+		_, err = rc.s.NewJob(
+			gocron.DurationJob(reapInterval),
+			gocron.NewTask(
+				rc.runReapSoftDeletedTenants(ctx),
+			),
+			gocron.WithSingletonMode(gocron.LimitModeReschedule),
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("could not set up runReapSoftDeletedTenants: %w", err)
 		}
 	}
 

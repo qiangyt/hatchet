@@ -261,6 +261,8 @@ tenants_to_update AS (
     FROM
         "Tenant" AS tenants
     -- For the controller partition, we DO use the internal tenant as well
+    WHERE
+        tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -296,8 +298,11 @@ WITH active_partitions AS (
     FROM
         "Tenant" AS tenants
     WHERE
-        "controllerPartitionId" IS NULL OR
-        "controllerPartitionId" IN (SELECT "id" FROM inactive_partitions)
+        (
+            "controllerPartitionId" IS NULL OR
+            "controllerPartitionId" IN (SELECT "id" FROM inactive_partitions)
+        )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "controllerPartitionId" = partitions."id"
@@ -340,6 +345,7 @@ tenants_to_update AS (
         "Tenant" AS tenants
     WHERE
         tenants."slug" != 'internal'
+        AND tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -380,6 +386,7 @@ WITH active_partitions AS (
             "workerPartitionId" IS NULL OR
             "workerPartitionId" IN (SELECT "id" FROM inactive_partitions)
         )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "workerPartitionId" = partitions."id"
@@ -431,6 +438,7 @@ tenants_to_update AS (
         "Tenant" AS tenants
     WHERE
         tenants."slug" != 'internal'
+        AND tenants."deletedAt" IS NULL
 )
 UPDATE
     "Tenant" AS tenants
@@ -471,6 +479,7 @@ WITH active_partitions AS (
             "schedulerPartitionId" IS NULL OR
             "schedulerPartitionId" IN (SELECT "id" FROM inactive_partitions)
         )
+        AND tenants."deletedAt" IS NULL
 ), update_tenants AS (
     UPDATE "Tenant" AS tenants
     SET "schedulerPartitionId" = partitions."id"
@@ -651,6 +660,23 @@ SET "deletedAt" = NOW(),
     slug = slug || '_deleted_' || gen_random_uuid()
 WHERE "id" = @id::uuid
 RETURNING *;
+
+-- name: ListSoftDeletedTenantsBefore :many
+SELECT
+    *
+FROM
+    "Tenant" as tenants
+WHERE
+    "deletedAt" IS NOT NULL AND
+    "deletedAt" < sqlc.arg('before')::timestamptz
+ORDER BY
+    "deletedAt" ASC
+LIMIT
+    sqlc.arg('maxCount')::int;
+
+-- name: HardDeleteTenant :execrows
+DELETE FROM "Tenant"
+WHERE "id" = sqlc.arg('id')::uuid;
 
 -- name: GetTenantUsageData :one
 WITH active_workers AS (

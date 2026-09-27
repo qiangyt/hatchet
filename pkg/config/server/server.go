@@ -56,6 +56,12 @@ type ServerConfigFile struct {
 
 	EnableWorkerRetention bool `mapstructure:"enableWorkerRetention" json:"enableWorkerRetention,omitempty" default:"false"`
 
+	EnableSoftDeleteTenantReap bool `mapstructure:"enableSoftDeleteTenantReap" json:"enableSoftDeleteTenantReap,omitempty" default:"false"`
+
+	SoftDeleteTenantReapGracePeriod string `mapstructure:"softDeleteTenantReapGracePeriod" json:"softDeleteTenantReapGracePeriod,omitempty" default:"720h"`
+
+	SoftDeleteTenantReapInterval string `mapstructure:"softDeleteTenantReapInterval" json:"softDeleteTenantReapInterval,omitempty" default:"15m"`
+
 	TLS shared.TLSConfigFile `mapstructure:"tls" json:"tls,omitempty"`
 
 	InternalClient InternalClientTLSConfigFile `mapstructure:"internalClient" json:"internalClient,omitempty"`
@@ -732,6 +738,12 @@ type ServerConfig struct {
 
 	EnableWorkerRetention bool
 
+	EnableSoftDeleteTenantReap bool
+
+	SoftDeleteTenantReapGracePeriod string
+
+	SoftDeleteTenantReapInterval string
+
 	Namespaces []string
 
 	MessageQueueV1 msgqueue.MessageQueue
@@ -834,6 +846,9 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("pausedControllers", "SERVER_PAUSED_CONTROLLERS")
 	_ = v.BindEnv("enableDataRetention", "SERVER_ENABLE_DATA_RETENTION")
 	_ = v.BindEnv("enableWorkerRetention", "SERVER_ENABLE_WORKER_RETENTION")
+	_ = v.BindEnv("enableSoftDeleteTenantReap", "SERVER_ENABLE_SOFT_DELETE_TENANT_REAP")
+	_ = v.BindEnv("softDeleteTenantReapGracePeriod", "SERVER_SOFT_DELETE_TENANT_REAP_GRACE_PERIOD")
+	_ = v.BindEnv("softDeleteTenantReapInterval", "SERVER_SOFT_DELETE_TENANT_REAP_INTERVAL")
 	_ = v.BindEnv("runtime.enforceLimits", "SERVER_ENFORCE_LIMITS")
 	_ = v.BindEnv("runtime.allowSignup", "SERVER_ALLOW_SIGNUP")
 	_ = v.BindEnv("runtime.allowInvites", "SERVER_ALLOW_INVITES")
