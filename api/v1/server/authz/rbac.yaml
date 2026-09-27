@@ -15,6 +15,7 @@ roles:
       - TenantMemberList
       - TenantInviteUpdate
       - TenantInviteDelete
+      - TenantDelete
   MEMBER:
     inherits: [VIEWER]
     permissions:

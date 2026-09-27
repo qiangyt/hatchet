@@ -21,6 +21,8 @@ var adminAndOwnerOnly = []string{
 	"ApiTokenList",
 	"ApiTokenCreate",
 	"ApiTokenUpdateRevoke",
+	// only owners (and admins via inheritance) may delete a tenant
+	"TenantDelete",
 }
 
 // memberOnlyOps are operations available to MEMBER (and above) that VIEWER should not have -
