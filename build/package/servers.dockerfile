@@ -46,13 +46,23 @@ RUN echo '{ "type": "module", "dependencies": { "@redocly/openapi-core": "2.14.7
 # --------------------
 FROM base AS build-go
 
-ARG VERSION=v0.1.0-alpha.0
+# wx fork: VERSION is REQUIRED (no silent fallback). Upstream defaulted this to the
+# v0.1.0-alpha.0 placeholder; an image built without --build-arg VERSION then reports
+# that bogus string via GetVersion, which breaks downstream version gates silently.
+# Fail the build instead of shipping a binary that lies about its version.
+ARG VERSION
 
 # can be set to "api", "engine", "admin" or "lite"
 ARG SERVER_TARGET
 
 # optional go build tags, e.g. "authdisabled" for dev images
 ARG GO_BUILD_TAGS=""
+
+# fail fast on a missing/placeholder VERSION before paying the Go compile
+RUN if [ -z "$VERSION" ] || [ "$VERSION" = "v0.1.0-alpha.0" ]; then \
+    echo "VERSION build-arg is required (e.g. --build-arg VERSION=v0.105.16): the upstream default is a placeholder that would be baked into the binary and reported by GetVersion"; \
+    exit 1; \
+    fi
 
 # check if the target is empty or not set to api, engine, lite, or admin
 RUN if [ -z "$SERVER_TARGET" ] || [ "$SERVER_TARGET" != "api" ] && [ "$SERVER_TARGET" != "engine" ] && [ "$SERVER_TARGET" != "admin" ] && [ "$SERVER_TARGET" != "lite" ] && [ "$SERVER_TARGET" != "migrate" ]; then \

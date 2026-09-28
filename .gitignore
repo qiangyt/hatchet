@@ -113,3 +113,6 @@ CLAUDE.md
 
 sdks/go/generator
 .pymon
+
+# wx build-image.py 运行日志（workspace 五仓 logs/ 同惯例 gitignored）
+logs/
