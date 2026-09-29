@@ -1,5 +1,6 @@
 # Base Go environment
 # -------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM golang:1.26-alpine as base
 WORKDIR /hatchet
 
@@ -20,6 +21,7 @@ RUN go test -c -tags e2e -v -o ./bin/e2e-test ./sdks/go/e2e/
 
 # Deployment environment
 # ----------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM alpine AS deployment
 
 WORKDIR /hatchet

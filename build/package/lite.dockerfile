@@ -10,6 +10,7 @@ FROM $HATCHET_ADMIN_IMAGE as admin-binary-base
 FROM $HATCHET_MIGRATE_IMAGE as migrate-binary-base
 
 # Stage 2: build the frontend
+# TODO： base 镜像应该锁定版本和digest
 FROM node:22-alpine as frontend-build
 
 WORKDIR /app
@@ -22,6 +23,7 @@ COPY ./frontend/app ./
 RUN npm run build
 
 # Stage 3: deployment image from alpine
+# TODO： base 镜像应该锁定版本和digest
 FROM alpine AS deployment
 
 # install bash via apk

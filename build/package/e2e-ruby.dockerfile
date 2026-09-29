@@ -1,5 +1,6 @@
 # Base Ruby environment
 # ---------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM ruby:3.2 AS deployment
 
 WORKDIR /hatchet/sdks/ruby

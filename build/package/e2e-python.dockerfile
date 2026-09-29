@@ -1,5 +1,6 @@
 # Base Python environment
 # -----------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM python:3.13-slim AS deployment
 
 WORKDIR /hatchet/sdks/python

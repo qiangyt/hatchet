@@ -1,4 +1,5 @@
 # Stage 1: Build the frontend app
+# TODO： base 镜像应该锁定版本和digest
 FROM node:20-alpine3.21 AS build
 
 WORKDIR /app
@@ -11,6 +12,7 @@ COPY ./frontend/app ./
 RUN npm run build
 
 # Stage 2: Build the static fileserver
+# TODO： base 镜像应该锁定版本和digest
 FROM golang:1.26-alpine AS staticfileserver
 
 WORKDIR /app
@@ -24,6 +26,7 @@ RUN go build -ldflags="-w -s" -a -o hatchet-staticfileserver ./cmd/hatchet-stati
 RUN chmod +x ./hatchet-staticfileserver
 
 # Stage 3: Run the static fileserver
+# TODO： base 镜像应该锁定版本和digest
 FROM alpine:3.21
 
 ENV BASE_PATH="/"

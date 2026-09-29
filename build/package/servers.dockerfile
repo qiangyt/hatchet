@@ -1,5 +1,6 @@
 # Base Go environment
 # -------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM golang:1.26-alpine as base
 WORKDIR /hatchet
 
@@ -31,6 +32,7 @@ RUN go generate ./...
 
 # OpenAPI bundle environment (uses openapi-core only to avoid Redoc/React/styled-components)
 # ----------------------------------------------------------------------------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM node:22-alpine AS build-openapi
 WORKDIR /openapi
 
@@ -73,6 +75,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 # Deployment environment
 # ----------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM alpine AS deployment
 
 # can be set to "api", "engine", "admin" or "lite"

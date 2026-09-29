@@ -1,5 +1,6 @@
 # Base Go environment
 # -------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM golang:1.26-alpine as base
 WORKDIR /hatchet
 
@@ -24,6 +25,7 @@ RUN go build -ldflags="-w -s" -a -o ./bin/hatchet-load-test-worker ./cli/go
 
 # Deployment environment
 # ----------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM alpine AS deployment
 
 WORKDIR /hatchet

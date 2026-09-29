@@ -6,6 +6,7 @@ ARG HATCHET_API_IMAGE
 FROM $HATCHET_API_IMAGE as api-binary-base
 
 # Stage 2: build the frontend
+# TODO： base 镜像应该锁定版本和digest
 FROM node:22-alpine as frontend-build
 
 WORKDIR /app
@@ -19,6 +20,7 @@ COPY ./frontend/app ./
 RUN npm run build
 
 # Stage 3: run in nginx alpine image
+# TODO： base 镜像应该锁定版本和digest
 FROM nginx:alpine
 
 ARG APP_TARGET=client

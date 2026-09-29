@@ -1,5 +1,6 @@
 # Base Node environment
 # ---------------------
+# TODO： base 镜像应该锁定版本和digest
 FROM node:20-alpine AS deployment
 
 WORKDIR /hatchet/sdks/typescript
