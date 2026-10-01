@@ -33,7 +33,10 @@ func (r *tenantRepository) ListSoftDeletedTenantsBefore(ctx context.Context, bef
 // Tables whose tenantId foreign key cascades from the tenant row delete are
 // covered by the final delete; the explicit per-table deletes cover the
 // rest. The table list comes from the database catalog, so new tables are
-// covered automatically. The whole operation runs in a single transaction.
+// covered automatically; the list is ordered children-first over the FK
+// graph (see tenantIdTablesInDeleteOrder — deletion-blocking FKs such as
+// Step→Action ON DELETE RESTRICT make alphabetical order fail). The whole
+// operation runs in a single transaction.
 func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUID) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -41,7 +44,7 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tables, err := tenantIdTables(ctx, tx)
+	tables, err := tenantIdTablesInDeleteOrder(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -67,16 +70,66 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 	return nil
 }
 
-// tenantIdTables lists public-schema tables that carry a tenantId column.
-// The list comes from the database catalog, so it never goes stale.
-func tenantIdTables(ctx context.Context, q interface {
+// tenantIdTablesInDeleteOrder lists public-schema tables that carry a
+// tenantId column, ordered so that referencing (child) tables come before
+// the tables they reference (parents). The list comes from the database
+// catalog, so it never goes stale.
+//
+// Why ordering matters: enforcement-mode FKs (ON DELETE RESTRICT checks
+// immediately, NO ACTION checks at statement end) make a parent-table delete
+// fail while child rows still exist. Plain alphabetical order breaks on the
+// real schema — e.g. "Action" sorts before "Step", but Step→Action is
+// RESTRICT, so every tenant with workflow history failed to reap
+// (Step_actionId_tenantId_fkey).
+//
+// Ordering is computed as the longest FK-chain depth per table over the
+// enforcement-mode FK graph (CASCADE/SET NULL edges impose no order;
+// self-references don't constrain a single-statement full-table delete and
+// are excluded). Children sit strictly deeper than their parents, so any
+// delete order within equal depths is safe. The depth cap keeps the
+// recursion terminating if the FK graph ever grows a cycle — the delete
+// then fails loudly on the cycle's own constraint rather than looping.
+//
+// The graph join runs on relation OIDs, NOT on regclass::text names:
+// regclass text output quoting differs across PostgreSQL versions (PG15
+// emits bare names, PG18 emits quoted names such as `"Step"`), which made a
+// name-based join silently match nothing and fall back to alphabetical
+// order. OIDs are version-stable.
+func tenantIdTablesInDeleteOrder(ctx context.Context, q interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }) ([]string, error) {
 	rows, err := q.Query(ctx, `
-		SELECT table_name
-		FROM information_schema.columns
-		WHERE table_schema = 'public' AND column_name = 'tenantId'
-		ORDER BY table_name
+		WITH RECURSIVE
+		tenant_tables AS (
+		    SELECT DISTINCT c.attrelid AS oid
+		    FROM pg_attribute c
+		    JOIN pg_class cls ON cls.oid = c.attrelid
+		    WHERE cls.relnamespace = 'public'::regnamespace
+		      AND cls.relkind = 'r'
+		      AND c.attname = 'tenantId'
+		),
+		blocking_edges AS (
+		    SELECT DISTINCT con.conrelid AS child,
+		                    con.confrelid AS parent
+		    FROM pg_constraint con
+		    WHERE con.contype = 'f'
+		      AND con.confdeltype NOT IN ('c', 's')
+		      AND con.conrelid <> con.confrelid
+		),
+		depths AS (
+		    SELECT tt.oid AS t, 0 AS depth FROM tenant_tables tt
+		    UNION
+		    SELECT e.child, d.depth + 1
+		    FROM depths d
+		    JOIN blocking_edges e ON e.parent = d.t
+		    JOIN tenant_tables tt ON tt.oid = e.child
+		    WHERE d.depth < 100
+		)
+		SELECT cls.relname
+		FROM depths
+		JOIN pg_class cls ON cls.oid = depths.t
+		GROUP BY cls.oid, cls.relname, depths.t
+		ORDER BY max(depths.depth) DESC, cls.relname ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("could not discover tenant tables: %w", err)

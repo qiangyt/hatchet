@@ -405,6 +405,113 @@ func TestTenantIdTablesFailsWhenPoolClosed(t *testing.T) {
 
 	pool.Close()
 
-	_, err := tenantIdTables(ctx(t), pool)
+	_, err := tenantIdTablesInDeleteOrder(ctx(t), pool)
 	require.Error(t, err, "a catalog failure must propagate, not look like an empty table list")
+}
+
+// TestTenantIdTablesInDeleteOrder verifies the discovery ordering on the real
+// migrated schema: every referencing (child) table sorts strictly before the
+// table it references via an enforcement-mode FK. Alphabetical order — the
+// pre-fix behavior — violated this on Step→Action (RESTRICT) and several
+// NO ACTION pairs, which is what made production reaps fail with
+// Step_actionId_tenantId_fkey.
+func TestTenantIdTablesInDeleteOrder(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	tables, err := tenantIdTablesInDeleteOrder(ctx(t), pool)
+	require.NoError(t, err)
+
+	position := make(map[string]int, len(tables))
+	for i, table := range tables {
+		position[table] = i
+	}
+
+	// The authoritative pair set, derived from the live catalog (2026-09-30
+	// meta DB): enforcement-mode FKs (RESTRICT/NO ACTION/SET DEFAULT) whose
+	// BOTH sides are tenant-scoped tables. SET NULL pairs impose no delete
+	// order (parent delete nulls the child column); pairs with a global side
+	// (no tenantId — "Dispatcher"/"Ticker"/"WorkflowTriggerScheduledRef"/…)
+	// are outside the reap's discovery set. The two RESTRICT pairs here are
+	// exactly what alphabetical order violated in production.
+	childBeforeParent := [][2]string{
+		{"Step", "Action"},
+		{"StepRateLimit", "RateLimit"},
+	}
+	for _, pair := range childBeforeParent {
+		childPos, childOK := position[pair[0]]
+		parentPos, parentOK := position[pair[1]]
+		require.True(t, childOK, "child table %s must be discovered", pair[0])
+		require.True(t, parentOK, "parent table %s must be discovered", pair[1])
+		assert.Less(t, childPos, parentPos,
+			"child %s (pos %d) must be deleted before parent %s (pos %d)",
+			pair[0], childPos, pair[1], parentPos)
+	}
+}
+
+// TestReapTenantDataDeletesChildrenBeforeParents is the end-to-end regression
+// for the production reap failure: a parent table that sorts alphabetically
+// before its child (RESTRICT FK) used to be deleted first, tripping the FK
+// and rolling the whole reap back — the tenant stayed soft-deleted forever
+// (68 corpses on the production meta DB). The synthetic pair mirrors the
+// real Action/Step shape: "aa_reap_parent" sorts before "zz_reap_child".
+func TestReapTenantDataDeletesChildrenBeforeParents(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	_, err := pool.Exec(ctx(t), `
+		CREATE TABLE "aa_reap_parent" (
+		    "id" UUID NOT NULL,
+		    "tenantId" UUID NOT NULL,
+		    CONSTRAINT "aa_reap_parent_pkey" PRIMARY KEY ("id"),
+		    CONSTRAINT "aa_reap_parent_id_tenantId_key" UNIQUE ("id", "tenantId")
+		)
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx(t), `DROP TABLE IF EXISTS "zz_reap_child"`)
+		_, _ = pool.Exec(ctx(t), `DROP TABLE IF EXISTS "aa_reap_parent"`)
+	})
+
+	_, err = pool.Exec(ctx(t), `
+		CREATE TABLE "zz_reap_child" (
+		    "id" UUID NOT NULL,
+		    "tenantId" UUID NOT NULL,
+		    "parentId" UUID NOT NULL,
+		    CONSTRAINT "zz_reap_child_pkey" PRIMARY KEY ("id"),
+		    CONSTRAINT "zz_reap_child_parent_fkey" FOREIGN KEY ("parentId", "tenantId")
+		        REFERENCES "aa_reap_parent" ("id", "tenantId") ON DELETE RESTRICT
+		)
+	`)
+	require.NoError(t, err)
+
+	tenantRepo := createSoftDeleteTestTenantRepository(pool)
+	tenantId := insertSoftDeleteTestTenant(t, pool, "reap-order")
+
+	parentId := uuid.New()
+	_, err = pool.Exec(ctx(t),
+		`INSERT INTO "aa_reap_parent" ("id", "tenantId") VALUES ($1, $2)`,
+		parentId, tenantId)
+	require.NoError(t, err)
+	childId := uuid.New()
+	_, err = pool.Exec(ctx(t),
+		`INSERT INTO "zz_reap_child" ("id", "tenantId", "parentId") VALUES ($1, $2, $3)`,
+		childId, tenantId, parentId)
+	require.NoError(t, err)
+
+	err = tenantRepo.DeleteTenant(ctx(t), tenantId)
+	require.NoError(t, err)
+
+	// Pre-fix this failed with a foreign-key violation on aa_reap_parent
+	// (alphabetical order deleted the parent before the child).
+	err = tenantRepo.ReapTenantData(ctx(t), tenantId)
+	require.NoError(t, err)
+
+	for _, table := range []string{"aa_reap_parent", "zz_reap_child"} {
+		var count int
+		err := pool.QueryRow(ctx(t),
+			`SELECT count(*) FROM `+quoteTable(table)+` WHERE "tenantId" = $1`, tenantId).Scan(&count)
+		require.NoError(t, err, "failed to check table %s", table)
+		assert.Zero(t, count, "table %s must hold no rows for the reaped tenant", table)
+	}
 }
