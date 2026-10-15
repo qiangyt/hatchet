@@ -404,7 +404,10 @@ func (r *OLAPRepositoryImpl) UpdateTablePartitions(ctx context.Context) error {
 	}
 
 	if len(leases) == 0 {
-		r.l.Debug().Ctx(ctx).Msg("partition operations already running on another controller instance, skipping")
+		// Normal in multi-instance deployments (the peer that holds the lease
+		// runs the DDL), but this skip is the exact symptom that preceded the
+		// 2026-10-15 fleet-wide partition outage, so it must be visible at warn.
+		r.l.Warn().Ctx(ctx).Msg("partition operations already running on another controller instance, skipping")
 		return nil
 	}
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -911,6 +912,19 @@ func (r *tenantRepository) RebalanceInactiveSchedulerPartitions(ctx context.Cont
 }
 
 func (r *tenantRepository) DeleteTenant(ctx context.Context, id uuid.UUID) error {
+	// The internal tenant family is engine-critical (partition maintenance
+	// resolves it every cycle). The legacy name/slug trigger already blocks any
+	// UPDATE of the pristine row, but a refusal here states the invariant where
+	// callers can act on it, instead of surfacing an incidental constraint
+	// violation.
+	var slug string
+	err := r.pool.QueryRow(ctx, `SELECT "slug" FROM "Tenant" WHERE "id" = $1`, id).Scan(&slug)
+	if err == nil && (slug == "internal" || strings.HasPrefix(slug, "internal_deleted_")) {
+		return fmt.Errorf("refusing to delete the internal tenant (slug %q): partition maintenance depends on it", slug)
+	} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+
 	tenant, err := r.queries.DeleteTenant(ctx, r.pool, id)
 
 	if err != nil {

@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,10 @@ import (
 )
 
 func createOLAPRepository(pool *pgxpool.Pool) *OLAPRepositoryImpl {
-	logger := zerolog.Nop()
+	return createOLAPRepositoryWithLogger(pool, zerolog.Nop())
+}
+
+func createOLAPRepositoryWithLogger(pool *pgxpool.Pool, logger zerolog.Logger) *OLAPRepositoryImpl {
 	shared := &sharedRepository{
 		pool:    pool,
 		ddlPool: pool,
@@ -37,6 +41,32 @@ func createOLAPRepository(pool *pgxpool.Pool) *OLAPRepositoryImpl {
 		shouldPartitionEventsTables: false,
 		shouldPartitionOtelTables:   false,
 	}
+}
+
+// TestOLAPUpdateTablePartitions_LeaseHeldElsewhere_WarnsAndSkips pins the
+// observability of the lease-miss skip: skipping partition maintenance because
+// another instance holds the lease is normal in multi-instance deployments but
+// invisible at Debug level. When partition maintenance stops fleet-wide (the
+// 2026-10-15 incident), the skip must be the first thing an operator sees, so
+// it logs at Warn.
+func TestOLAPUpdateTablePartitions_LeaseHeldElsewhere_WarnsAndSkips(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	holder := createOLAPRepository(pool)
+	leases, err := holder.acquirePartitionLease(ctx(t), pool, "v1_olap_partitions")
+	require.NoError(t, err)
+	require.NotEmpty(t, leases, "the first acquisition must take the lease")
+
+	var buf bytes.Buffer
+	repo := createOLAPRepositoryWithLogger(pool, zerolog.New(&buf))
+
+	err = repo.UpdateTablePartitions(ctx(t))
+	require.NoError(t, err)
+
+	assert.Contains(t, buf.String(), `"level":"warn"`,
+		"the lease-miss skip must be visible at warn level, not buried at debug")
+	assert.Contains(t, buf.String(), "already running")
 }
 
 func TestOLAPUpdateTablePartitions_ConcurrentControllers(t *testing.T) {

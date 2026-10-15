@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +45,24 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 		return fmt.Errorf("could not begin reap transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	var slug string
+	err = tx.QueryRow(ctx, `SELECT "slug" FROM "Tenant" WHERE "id" = $1`, tenantId).Scan(&slug)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("tenant %s no longer exists", tenantId)
+	} else if err != nil {
+		return fmt.Errorf("could not look up tenant for reap: %w", err)
+	}
+
+	// The internal tenant (and its soft-delete-renamed descendants) is
+	// engine-critical: the OLAP controller's partition maintenance job resolves
+	// it on every cycle, and losing the row stops partition creation silently.
+	// The generic soft-delete path cannot produce this state (any UPDATE of the
+	// internal row raises on prevent_internal_name_or_slug), but the reap is
+	// the last line of defense, so refuse here too.
+	if slug == "internal" || strings.HasPrefix(slug, "internal_deleted_") {
+		return fmt.Errorf("refusing to reap the internal tenant (slug %q): partition maintenance depends on it", slug)
+	}
 
 	tables, err := tenantIdTablesInDeleteOrder(ctx, tx)
 	if err != nil {

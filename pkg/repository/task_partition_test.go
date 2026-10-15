@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"sync"
@@ -83,7 +84,10 @@ func setupPostgresWithMigration(t *testing.T) (*pgxpool.Pool, func()) {
 }
 
 func createTaskRepository(pool *pgxpool.Pool) *TaskRepositoryImpl {
-	logger := zerolog.Nop()
+	return createTaskRepositoryWithLogger(pool, zerolog.Nop())
+}
+
+func createTaskRepositoryWithLogger(pool *pgxpool.Pool, logger zerolog.Logger) *TaskRepositoryImpl {
 	shared := &sharedRepository{
 		pool:    pool,
 		ddlPool: pool,
@@ -95,6 +99,30 @@ func createTaskRepository(pool *pgxpool.Pool) *TaskRepositoryImpl {
 		taskRetentionPeriod:   24 * time.Hour,
 		maxInternalRetryCount: 3,
 	}
+}
+
+// TestTaskUpdateTablePartitions_LeaseHeldElsewhere_WarnsAndSkips pins the
+// observability of the lease-miss skip on the business-table partition job
+// (same incident class as the OLAP variant: a silently skipped maintenance
+// cycle only surfaces when the partitions run out).
+func TestTaskUpdateTablePartitions_LeaseHeldElsewhere_WarnsAndSkips(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	holder := createTaskRepository(pool)
+	leases, err := holder.acquirePartitionLease(ctx(t), pool, "v1_task_partitions")
+	require.NoError(t, err)
+	require.NotEmpty(t, leases, "the first acquisition must take the lease")
+
+	var buf bytes.Buffer
+	repo := createTaskRepositoryWithLogger(pool, zerolog.New(&buf))
+
+	err = repo.UpdateTablePartitions(ctx(t))
+	require.NoError(t, err)
+
+	assert.Contains(t, buf.String(), `"level":"warn"`,
+		"the lease-miss skip must be visible at warn level, not buried at debug")
+	assert.Contains(t, buf.String(), "already running")
 }
 
 func TestUpdateTablePartitions_ConcurrentControllers(t *testing.T) {
