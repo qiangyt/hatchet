@@ -22,5 +22,18 @@ if ./hatchet-admin authdisabled; then
   echo "====================================================================="
 fi
 
+# Optional durable file log: when LITE_LOG_FILE is set (typically a bind
+# mount), tee stdout+stderr into it so engine logs survive container
+# recreation — docker logs are lost with the container, and the 2026-10-15
+# partition-outage investigation was blocked exactly by that. Process
+# substitution keeps the binary as PID 1 (via exec), so SIGTERM from
+# `docker stop` still reaches hatchet-lite for graceful shutdown; stdout keeps
+# flowing to docker logs in parallel.
+if [ -n "$LITE_LOG_FILE" ]; then
+  mkdir -p "$(dirname "$LITE_LOG_FILE")"
+  echo "logging to file: $LITE_LOG_FILE"
+  exec > >(tee -a "$LITE_LOG_FILE") 2>&1
+fi
+
 # Run the Go binary
 exec ./hatchet-lite --config ./config
