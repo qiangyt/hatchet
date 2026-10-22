@@ -4,11 +4,11 @@ import (
 	"crypto/tls"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
-	"google.golang.org/grpc"
 
 	"github.com/hatchet-dev/hatchet/api/v1/server/middleware"
 	"github.com/hatchet-dev/hatchet/internal/integrations/alerting"
@@ -26,6 +26,7 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/errors"
 	"github.com/hatchet-dev/hatchet/pkg/integrations/email"
 	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
+	"github.com/hatchet-dev/hatchet/pkg/o11yusage"
 	"github.com/hatchet-dev/hatchet/pkg/scheduling"
 	"github.com/hatchet-dev/hatchet/pkg/validator"
 )
@@ -298,10 +299,12 @@ type ConfigFileRuntime struct {
 	// The loader splits this into AllowedOrigins at startup.
 	AllowedOriginsString string `mapstructure:"allowedOriginsString" json:"allowedOriginsString,omitempty"`
 
-	// OperatorInfraBlockedCIDRs are additional CIDR ranges the HTTP operator blocks when
-	// delivering outbound requests (our own infrastructure: VPC, metadata, internal LBs),
-	// on top of the built-in reserved/private denylist. Populated from
-	// OperatorInfraBlockedCIDRsString at startup; do not set directly via env.
+	// OperatorInfraBlockedCIDRs are additional CIDR ranges that consumers of
+	// pkg/operator/safeclient block when delivering outbound requests (our own
+	// infrastructure: VPC, metadata, internal LBs), on top of the built-in
+	// reserved/private denylist. The engine does not read it today; it is kept so the
+	// serverless operator can consume it. Populated from OperatorInfraBlockedCIDRsString
+	// at startup; do not set directly via env.
 	OperatorInfraBlockedCIDRs []string `mapstructure:"operatorInfraBlockedCIDRs" json:"operatorInfraBlockedCIDRs,omitempty"`
 
 	// OperatorInfraBlockedCIDRsString is the raw space-separated value used for env binding
@@ -313,6 +316,20 @@ type ConfigFileRuntime struct {
 	// orchestrates concurrently)
 	DagOperatorDefaultSlots int `mapstructure:"dagOperatorDefaultSlots" json:"dagOperatorDefaultSlots,omitempty" default:"10000"`
 
+	// GRPCOperatorsEnabled registers the v1.OperatorService gRPC API for operators running outside the engine
+	// process. Off by default; when disabled the service is not registered and callers receive Unimplemented.
+	GRPCOperatorsEnabled bool `mapstructure:"grpcOperatorsEnabled" json:"grpcOperatorsEnabled,omitempty" default:"false"`
+
+	// GRPCOperatorMaxListenStreamsPerOperator caps the Listen streams one operator holds open on this replica
+	// (SERVER_GRPC_OPERATOR_MAX_LISTEN_STREAMS_PER_OPERATOR). Each stream is a live worker, metered like an SDK
+	// worker; the cap bounds what one operator can hold on a replica on top of the tenant's worker limit. A
+	// stream over the cap is refused with ResourceExhausted before its worker is activated. Zero disables the cap.
+	GRPCOperatorMaxListenStreamsPerOperator int `mapstructure:"grpcOperatorMaxListenStreamsPerOperator" json:"grpcOperatorMaxListenStreamsPerOperator,omitempty" default:"100"`
+
+	// GRPCOperatorMaxActionsPerOperator caps the action links held across all workers of one operator
+	// (SERVER_GRPC_OPERATOR_MAX_ACTIONS_PER_OPERATOR). A delta that would newly link actions over the cap is
+	// refused with ResourceExhausted and links nothing. Zero disables the cap.
+	GRPCOperatorMaxActionsPerOperator int64 `mapstructure:"grpcOperatorMaxActionsPerOperator" json:"grpcOperatorMaxActionsPerOperator,omitempty" default:"1000000"`
 	// SchedulerConcurrencyRateLimit is the rate limit for scheduler concurrency strategy execution (per second)
 	SchedulerConcurrencyRateLimit int `mapstructure:"schedulerConcurrencyRateLimit" json:"schedulerConcurrencyRateLimit,omitempty" default:"20"`
 
@@ -336,11 +353,27 @@ type ConfigFileRuntime struct {
 	// LogIngestionEnabled controls whether the server enables log ingestion for tasks
 	LogIngestionEnabled bool `mapstructure:"logIngestionEnabled" json:"logIngestionEnabled,omitempty" default:"true"`
 
+	// O11yUsageFlushInterval is how often the engine flushes per-tenant ingested
+	// log/span bytes to the optional O11yUsageFlush callback.
+	O11yUsageFlushInterval time.Duration `mapstructure:"o11yUsageFlushInterval" json:"o11yUsageFlushInterval,omitempty" default:"30s"`
+
 	// TaskOperationLimits controls the limits for various task operations
 	TaskOperationLimits TaskOperationLimitsConfigFile `mapstructure:"taskOperationLimits" json:"taskOperationLimits,omitempty"`
 
 	// WorkflowRunBufferSize is the buffer size for workflow run event batching in the dispatcher
 	WorkflowRunBufferSize int `mapstructure:"workflowRunBufferSize" json:"workflowRunBufferSize,omitempty" default:"1000"`
+
+	// DurableEventBufferFlushInterval is how long a durable task event waits in the
+	// ingestion buffer to accumulate a batch before the batch is flushed to the database.
+	DurableEventBufferFlushInterval time.Duration `mapstructure:"durableEventBufferFlushInterval" json:"durableEventBufferFlushInterval,omitempty" default:"5ms"`
+
+	// DurableEventBufferMaxSize caps how many durable task events a single flush
+	// batches together, so a burst of traffic still flushes promptly.
+	DurableEventBufferMaxSize int `mapstructure:"durableEventBufferMaxSize" json:"durableEventBufferMaxSize,omitempty" default:"100"`
+
+	// DurableEventBufferMaxConcurrentFlushes bounds how many durable event ingestion
+	// transactions run concurrently.
+	DurableEventBufferMaxConcurrentFlushes int `mapstructure:"durableEventBufferMaxConcurrentFlushes" json:"durableEventBufferMaxConcurrentFlushes,omitempty" default:"16"`
 
 	// StreamEventBufferTimeout is the timeout duration for the stream event buffer in the dispatcher.
 	// This controls how long the buffer waits for out-of-order events before flushing them.
@@ -722,6 +755,10 @@ type ServerConfig struct {
 
 	Analytics analytics.Analytics
 
+	// O11yUsageFlush, when set, receives periodic tenant → log/otel byte maps
+	// from the engine. Nil means the aggregator is not started (OSS / self-host).
+	O11yUsageFlush o11yusage.FlushFunc
+
 	Pylon *PylonConfig
 
 	FePosthog *FePosthogConfig
@@ -784,7 +821,7 @@ type ServerConfig struct {
 
 	Operations ConfigFileOperations
 
-	GRPCInterceptors []grpc.UnaryServerInterceptor
+	GRPCInterceptors []connect.UnaryInterceptorFunc
 
 	Version string
 
@@ -813,7 +850,7 @@ func (c *ServerConfig) HasService(name string) bool {
 	return false
 }
 
-func (c *ServerConfig) AddGRPCUnaryInterceptor(interceptor grpc.UnaryServerInterceptor) {
+func (c *ServerConfig) AddGRPCUnaryInterceptor(interceptor connect.UnaryInterceptorFunc) {
 	c.GRPCInterceptors = append(c.GRPCInterceptors, interceptor)
 }
 
@@ -866,6 +903,9 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("runtime.allowedOriginsString", "SERVER_ALLOWED_ORIGINS")
 	_ = v.BindEnv("runtime.operatorInfraBlockedCIDRsString", "SERVER_OPERATOR_INFRA_BLOCKED_CIDRS")
 	_ = v.BindEnv("runtime.dagOperatorDefaultSlots", "SERVER_DAG_OPERATOR_DEFAULT_SLOTS")
+	_ = v.BindEnv("runtime.grpcOperatorsEnabled", "SERVER_GRPC_OPERATORS_ENABLED")
+	_ = v.BindEnv("runtime.grpcOperatorMaxListenStreamsPerOperator", "SERVER_GRPC_OPERATOR_MAX_LISTEN_STREAMS_PER_OPERATOR")
+	_ = v.BindEnv("runtime.grpcOperatorMaxActionsPerOperator", "SERVER_GRPC_OPERATOR_MAX_ACTIONS_PER_OPERATOR")
 
 	// security check options
 	_ = v.BindEnv("securityCheck.enabled", "SERVER_SECURITY_CHECK_ENABLED")
@@ -894,6 +934,7 @@ func BindAllEnv(v *viper.Viper) {
 
 	// log ingestion
 	_ = v.BindEnv("runtime.logIngestionEnabled", "SERVER_LOG_INGESTION_ENABLED")
+	_ = v.BindEnv("runtime.o11yUsageFlushInterval", "SERVER_O11Y_USAGE_FLUSH_INTERVAL")
 
 	// alerting options
 	_ = v.BindEnv("alerting.sentry.enabled", "SERVER_ALERTING_SENTRY_ENABLED")
@@ -1076,6 +1117,9 @@ func BindAllEnv(v *viper.Viper) {
 
 	// dispatcher options
 	_ = v.BindEnv("runtime.workflowRunBufferSize", "SERVER_WORKFLOW_RUN_BUFFER_SIZE")
+	_ = v.BindEnv("runtime.durableEventBufferFlushInterval", "SERVER_DURABLE_EVENT_BUFFER_FLUSH_INTERVAL")
+	_ = v.BindEnv("runtime.durableEventBufferMaxSize", "SERVER_DURABLE_EVENT_BUFFER_MAX_SIZE")
+	_ = v.BindEnv("runtime.durableEventBufferMaxConcurrentFlushes", "SERVER_DURABLE_EVENT_BUFFER_MAX_CONCURRENT_FLUSHES")
 	_ = v.BindEnv("runtime.streamEventBufferTimeout", "SERVER_STREAM_EVENT_BUFFER_TIMEOUT")
 
 	// payload store options

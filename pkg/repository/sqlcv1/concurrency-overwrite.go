@@ -37,7 +37,14 @@ WITH filled_parent_slots AS (
         tenant_id = $1::uuid AND
         strategy_id = $3::bigint AND
         schedule_timeout_at < NOW() AND
-        is_filled = FALSE
+        NOT EXISTS (
+            SELECT 1
+            FROM v1_task_runtime tr
+            WHERE
+                tr.task_id = v1_concurrency_slot.task_id AND
+                tr.task_inserted_at = v1_concurrency_slot.task_inserted_at AND
+                tr.retry_count = v1_concurrency_slot.task_retry_count
+        )
     ORDER BY
         task_id, task_inserted_at
     FOR UPDATE
@@ -264,7 +271,9 @@ WITH slots AS (
     FROM
         v1_concurrency_slot
     WHERE
-        (task_inserted_at, task_id, task_retry_count, tenant_id, strategy_id) IN (
+        tenant_id = $1::uuid AND
+        strategy_id = $2::bigint AND
+        ((task_inserted_at, task_id, task_retry_count, tenant_id, strategy_id) IN (
             SELECT
                 ers.task_inserted_at,
                 ers.task_id,
@@ -276,8 +285,6 @@ WITH slots AS (
             ORDER BY
                 rn, seqnum
         ) OR (
-            tenant_id = $1::uuid AND
-            strategy_id = $2::bigint AND
             (task_inserted_at, task_id, task_retry_count) NOT IN (
                 SELECT
                     ers.task_inserted_at,
@@ -290,7 +297,7 @@ WITH slots AS (
                 SELECT wcs.strategy_id, wcs.workflow_version_id, wcs.workflow_run_id
                 FROM tmp_workflow_concurrency_slot wcs
             )
-        )
+        ))
     ORDER BY task_id ASC, task_inserted_at ASC, task_retry_count ASC
     FOR UPDATE
 ), updated_slots AS (
@@ -518,7 +525,9 @@ WITH slots AS (
     FROM
         v1_concurrency_slot cs
     WHERE
-        (cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
+        cs.tenant_id = $1::uuid AND
+        cs.strategy_id = $2::bigint AND
+        ((cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
             SELECT
                 ers.task_inserted_at,
                 ers.task_id,
@@ -530,8 +539,6 @@ WITH slots AS (
             ORDER BY
                 rn, seqnum
         ) OR (
-            cs.tenant_id = $1::uuid AND
-            cs.strategy_id = $2::bigint AND
             (cs.task_inserted_at, cs.task_id, cs.task_retry_count) NOT IN (
                 SELECT
                     ers.task_inserted_at,
@@ -544,7 +551,7 @@ WITH slots AS (
                 SELECT wcs.strategy_id, wcs.workflow_version_id, wcs.workflow_run_id
                 FROM tmp_workflow_concurrency_slot wcs
             )
-        )
+        ))
     ORDER BY
         cs.task_id ASC, cs.task_inserted_at ASC, cs.task_retry_count ASC
     FOR UPDATE
@@ -817,7 +824,9 @@ WITH slots AS (
     FROM
         v1_concurrency_slot cs
     WHERE
-        (cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
+        cs.tenant_id = $1::uuid AND
+        cs.strategy_id = $2::bigint AND
+        ((cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
             SELECT
                 ers.task_inserted_at,
                 ers.task_id,
@@ -829,8 +838,6 @@ WITH slots AS (
             ORDER BY
                 rn, seqnum
         ) OR (
-            cs.tenant_id = $1::uuid AND
-            cs.strategy_id = $2::bigint AND
             (cs.task_inserted_at, cs.task_id, cs.task_retry_count) NOT IN (
                 SELECT
                     ers.task_inserted_at,
@@ -851,7 +858,7 @@ WITH slots AS (
                 SELECT wcs.strategy_id, wcs.workflow_version_id, wcs.workflow_run_id
                 FROM tmp_workflow_concurrency_slot wcs
             )
-        )
+        ))
     ORDER BY
         cs.task_id ASC, cs.task_inserted_at ASC, cs.task_retry_count ASC
     FOR UPDATE
@@ -1131,7 +1138,9 @@ WITH slots AS (
     FROM
         v1_concurrency_slot cs
     WHERE
-        (cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
+        cs.tenant_id = $1::uuid AND
+        cs.strategy_id = $2::bigint AND
+        ((cs.task_inserted_at, cs.task_id, cs.task_retry_count, cs.tenant_id, cs.strategy_id) IN (
             SELECT
                 ers.task_inserted_at,
                 ers.task_id,
@@ -1143,8 +1152,6 @@ WITH slots AS (
             ORDER BY
                 rn, seqnum
         ) OR (
-            cs.tenant_id = $1::uuid AND
-            cs.strategy_id = $2::bigint AND
             (cs.task_inserted_at, cs.task_id, cs.task_retry_count) NOT IN (
                 SELECT
                     ers.task_inserted_at,
@@ -1165,7 +1172,7 @@ WITH slots AS (
                 SELECT wcs.strategy_id, wcs.workflow_version_id, wcs.workflow_run_id
                 FROM tmp_workflow_concurrency_slot wcs
             )
-        )
+        ))
     ORDER BY
         cs.task_id ASC, cs.task_inserted_at ASC, cs.task_retry_count ASC
     FOR UPDATE
@@ -1373,4 +1380,66 @@ func (q *Queries) UpdateConcurrencySlotIsFilledBatch(ctx context.Context, db DBT
 	}
 
 	return items, nil
+}
+
+const upsertTenantConcurrencyStrategies = `-- name: UpsertTenantConcurrencyStrategies :exec
+WITH input AS (
+    SELECT
+        unnest($2::text[]) AS name,
+        unnest(cast($3::text[] as v1_concurrency_strategy[])) AS strategy,
+        unnest($4::text[]) AS expression,
+        unnest($5::int[]) AS max_concurrency,
+        unnest($6::text[]) AS max_runs_expression
+)
+INSERT INTO v1_tenant_concurrency (
+    tenant_id,
+    name,
+    strategy,
+    expression,
+    max_concurrency,
+    max_runs_expression
+)
+SELECT
+    $1::uuid,
+    i.name,
+    i.strategy,
+    i.expression,
+    i.max_concurrency,
+    i.max_runs_expression
+FROM input i
+ORDER BY i.name
+ON CONFLICT (tenant_id, name)
+DO UPDATE SET
+    strategy = EXCLUDED.strategy,
+    expression = EXCLUDED.expression,
+    max_concurrency = EXCLUDED.max_concurrency,
+    max_runs_expression = EXCLUDED.max_runs_expression,
+    is_active = TRUE,
+    last_active_at = NOW()
+`
+
+type UpsertTenantConcurrencyStrategiesParams struct {
+	Tenantid           uuid.UUID     `json:"tenantid"`
+	Names              []string      `json:"names"`
+	Strategies         []string      `json:"strategies"`
+	Expressions        []string      `json:"expressions"`
+	Maxconcurrencies   []int32       `json:"maxconcurrencies"`
+	Maxrunsexpressions []pgtype.Text `json:"maxrunsexpressions"`
+}
+
+// UpsertTenantConcurrencyStrategies is a single-statement bulk upsert: one registration
+// touches all of a workflow's tenant strategy rows at once, in name order, so concurrent
+// registrations acquire row locks in a consistent order and cannot deadlock each other.
+// Hand-written so max_runs_expression can carry NULL elements ([]pgtype.Text); sqlc types
+// unnest'd array parameters as non-nullable slices.
+func (q *Queries) UpsertTenantConcurrencyStrategies(ctx context.Context, db DBTX, arg UpsertTenantConcurrencyStrategiesParams) error {
+	_, err := db.Exec(ctx, upsertTenantConcurrencyStrategies,
+		arg.Tenantid,
+		arg.Names,
+		arg.Strategies,
+		arg.Expressions,
+		arg.Maxconcurrencies,
+		arg.Maxrunsexpressions,
+	)
+	return err
 }

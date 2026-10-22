@@ -444,7 +444,7 @@ func (s *Scheduler) runSetTenants(ctx context.Context) func() {
 		tenants, err := s.repov1.Tenant().ListTenantsBySchedulerPartition(ctx, s.p.GetSchedulerPartitionId())
 
 		if err != nil {
-			s.l.Err(err).Ctx(ctx).Msg("could not list tenants")
+			logger.ShutdownAware(ctx, s.l, err, zerolog.ErrorLevel).Err(err).Ctx(ctx).Msg("could not list tenants")
 			return
 		}
 
@@ -1455,6 +1455,29 @@ func (s *Scheduler) handleDeadLetteredBatchStart(ctx context.Context, msg *msgqu
 	return nil
 }
 
+// maxDurableCallbackRedeliveries bounds the dead-letter retry loop for a durable callback that
+// no dispatcher can deliver (no active session). Each re-dispatch re-looks-up the task's
+// dispatcher, so a worker reconnecting mid-loop gets its callback; but without a cap this loops
+// forever (the dispatcher rejects -> DLX -> here -> fresh publish -> reject ...), which is a
+// self-inflicted storm during an engine roll. After the cap we drop it and rely on the worker's
+// GetSatisfiedDurableEvents poll on wait re-registration, timeout reassignment of the orphaned
+// task, or the OLAP reconcile sweeps.
+const maxDurableCallbackRedeliveries = 50
+
+// The dispatcher publishes undelivered callbacks straight to the dead-letter queue, which has no
+// message TTL, so without a delay here the whole retry budget is spent within a second, before a
+// reconnecting worker has had a chance to re-register its session.
+const (
+	durableCallbackRedeliveryBaseDelay = 100 * time.Millisecond
+	durableCallbackRedeliveryMaxDelay  = 5 * time.Second
+)
+
+func durableCallbackRedeliveryDelay(redeliveryCount int32) time.Duration {
+	delay := durableCallbackRedeliveryBaseDelay << min(redeliveryCount, 10)
+
+	return min(delay, durableCallbackRedeliveryMaxDelay)
+}
+
 func (s *Scheduler) handleDeadLetteredDurableCallbackCompleted(ctx context.Context, msg *msgqueue.Message) error {
 	payloads := msgqueue.JSONConvert[tasktypes.DurableCallbackCompletedPayload](msg.Payloads)
 
@@ -1482,6 +1505,11 @@ func (s *Scheduler) handleDeadLetteredDurableCallbackCompleted(ctx context.Conte
 			continue
 		}
 
+		if p.RedeliveryCount >= maxDurableCallbackRedeliveries {
+			s.l.Error().Ctx(ctx).Msgf("giving up on undelivered durable callback for task %s node %d after %d redeliveries; worker never re-registered its durable session. recovery now depends on task reassignment or reconcile.", p.TaskExternalId, p.NodeId, p.RedeliveryCount)
+			continue
+		}
+
 		callbacks = append(callbacks, repov1.SatisfiedEntry{
 			DurableTaskId:         t.ID,
 			DurableTaskInsertedAt: t.InsertedAt,
@@ -1492,7 +1520,26 @@ func (s *Scheduler) handleDeadLetteredDurableCallbackCompleted(ctx context.Conte
 			Data:                  p.Payload,
 			ChildTaskIsFailure:    p.ChildTaskIsFailure,
 			ChildTaskErrorMessage: p.ChildTaskErrorMessage,
+			RedeliveryCount:       p.RedeliveryCount + 1,
 		})
+	}
+
+	if len(callbacks) == 0 {
+		return nil
+	}
+
+	var maxRedeliveryCount int32
+
+	for _, cb := range callbacks {
+		maxRedeliveryCount = max(maxRedeliveryCount, cb.RedeliveryCount)
+	}
+
+	// the dead-letter message stays unacknowledged while we wait, so a scheduler that stops
+	// mid-delay has the message redelivered instead of losing the callbacks
+	select {
+	case <-time.After(durableCallbackRedeliveryDelay(maxRedeliveryCount)):
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	return durable.DispatchCallbacks(ctx, s.l, s.mq, s.repov1, msg.TenantID, callbacks)

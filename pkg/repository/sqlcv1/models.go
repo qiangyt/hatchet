@@ -1498,6 +1498,7 @@ type V1OperatorKind string
 const (
 	V1OperatorKindHTTPAPI V1OperatorKind = "HTTP_API"
 	V1OperatorKindDAG     V1OperatorKind = "DAG"
+	V1OperatorKindGRPC    V1OperatorKind = "GRPC"
 )
 
 func (e *V1OperatorKind) Scan(src interface{}) error {
@@ -1533,6 +1534,48 @@ func (ns NullV1OperatorKind) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return string(ns.V1OperatorKind), nil
+}
+
+type V1OperatorLeasingManager string
+
+const (
+	V1OperatorLeasingManagerSELF       V1OperatorLeasingManager = "SELF"
+	V1OperatorLeasingManagerDISPATCHER V1OperatorLeasingManager = "DISPATCHER"
+)
+
+func (e *V1OperatorLeasingManager) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = V1OperatorLeasingManager(s)
+	case string:
+		*e = V1OperatorLeasingManager(s)
+	default:
+		return fmt.Errorf("unsupported scan type for V1OperatorLeasingManager: %T", src)
+	}
+	return nil
+}
+
+type NullV1OperatorLeasingManager struct {
+	V1OperatorLeasingManager V1OperatorLeasingManager `json:"v1_operator_leasing_manager"`
+	Valid                    bool                     `json:"valid"` // Valid is true if V1OperatorLeasingManager is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullV1OperatorLeasingManager) Scan(value interface{}) error {
+	if value == nil {
+		ns.V1OperatorLeasingManager, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.V1OperatorLeasingManager.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullV1OperatorLeasingManager) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.V1OperatorLeasingManager), nil
 }
 
 type V1OtelSpanKind string
@@ -3284,6 +3327,8 @@ type V1ConcurrencySlot struct {
 	NextKeys              []string           `json:"next_keys"`
 	QueueToNotify         string             `json:"queue_to_notify"`
 	ScheduleTimeoutAt     pgtype.Timestamp   `json:"schedule_timeout_at"`
+	MaxRuns               pgtype.Int4        `json:"max_runs"`
+	NextMaxRuns           []int32            `json:"next_max_runs"`
 }
 
 type V1Dag struct {
@@ -3335,6 +3380,7 @@ type V1DagsOlap struct {
 	TotalTasks           int32                `json:"total_tasks"`
 	IdempotencyKey       pgtype.Text          `json:"idempotency_key"`
 	LatestRetryCount     int32                `json:"latest_retry_count"`
+	IsDagOperator        bool                 `json:"is_dag_operator"`
 }
 
 type V1DurableEventLogBranchPoint struct {
@@ -3565,14 +3611,15 @@ type V1OperationIntervalSettings struct {
 }
 
 type V1Operator struct {
-	ID        uuid.UUID          `json:"id"`
-	TenantID  uuid.UUID          `json:"tenant_id"`
-	Name      string             `json:"name"`
-	Kind      V1OperatorKind     `json:"kind"`
-	Config    []byte             `json:"config"`
-	WorkerID  *uuid.UUID         `json:"worker_id"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	ID             uuid.UUID                `json:"id"`
+	TenantID       uuid.UUID                `json:"tenant_id"`
+	Name           string                   `json:"name"`
+	Kind           V1OperatorKind           `json:"kind"`
+	LeasingManager V1OperatorLeasingManager `json:"leasing_manager"`
+	Config         []byte                   `json:"config"`
+	WorkerID       *uuid.UUID               `json:"worker_id"`
+	CreatedAt      pgtype.Timestamptz       `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz       `json:"updated_at"`
 }
 
 type V1OtelTraceLookupOlap struct {
@@ -3774,6 +3821,8 @@ type V1StepConcurrency struct {
 	Expression        string                `json:"expression"`
 	TenantID          uuid.UUID             `json:"tenant_id"`
 	MaxConcurrency    int32                 `json:"max_concurrency"`
+	TenantStrategyID  pgtype.Int8           `json:"tenant_strategy_id"`
+	MaxRunsExpression pgtype.Text           `json:"max_runs_expression"`
 }
 
 type V1StepMatchCondition struct {
@@ -3844,6 +3893,7 @@ type V1Task struct {
 	TriggeringEventKey           pgtype.Text        `json:"triggering_event_key"`
 	IdempotencyKey               pgtype.Text        `json:"idempotency_key"`
 	IsDagOrchestrator            bool               `json:"is_dag_orchestrator"`
+	ConcurrencyMaxRuns           []pgtype.Int4      `json:"concurrency_max_runs"`
 }
 
 type V1TaskEvent struct {
@@ -3967,6 +4017,18 @@ type V1TasksOlap struct {
 	IdempotencyKey       pgtype.Text          `json:"idempotency_key"`
 }
 
+type V1TenantConcurrency struct {
+	ID                int64                 `json:"id"`
+	TenantID          uuid.UUID             `json:"tenant_id"`
+	Name              string                `json:"name"`
+	IsActive          bool                  `json:"is_active"`
+	LastActiveAt      pgtype.Timestamptz    `json:"last_active_at"`
+	Strategy          V1ConcurrencyStrategy `json:"strategy"`
+	Expression        string                `json:"expression"`
+	MaxConcurrency    int32                 `json:"max_concurrency"`
+	MaxRunsExpression pgtype.Text           `json:"max_runs_expression"`
+}
+
 type V1WorkerSlotConfig struct {
 	TenantID  uuid.UUID          `json:"tenant_id"`
 	WorkerID  uuid.UUID          `json:"worker_id"`
@@ -4041,6 +4103,7 @@ type Worker struct {
 	MaxRuns                 int32            `json:"maxRuns"`
 	IsActive                bool             `json:"isActive"`
 	LastListenerEstablished pgtype.Timestamp `json:"lastListenerEstablished"`
+	LastListenerSessionId   *uuid.UUID       `json:"lastListenerSessionId"`
 	IsPaused                bool             `json:"isPaused"`
 	Type                    WorkerType       `json:"type"`
 	WebhookId               *uuid.UUID       `json:"webhookId"`
@@ -4052,6 +4115,8 @@ type Worker struct {
 	SdkVersion              pgtype.Text      `json:"sdkVersion"`
 	DurableTaskDispatcherId *uuid.UUID       `json:"durableTaskDispatcherId"`
 	ActionHash              []byte           `json:"actionHash"`
+	OperatorActionCount     int32            `json:"operatorActionCount"`
+	IsExemptFromLimits      bool             `json:"isExemptFromLimits"`
 }
 
 type WorkerAssignEvent struct {

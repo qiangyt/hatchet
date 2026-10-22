@@ -177,6 +177,9 @@ type SatisfiedEntry struct {
 	SatisfiedOrder        *int64
 	InvocationCount       int32
 	DurableTaskExternalId uuid.UUID
+	// RedeliveryCount is non-zero only when this entry is being re-dispatched from the
+	// dead-letter path; it bounds that retry loop.
+	RedeliveryCount int32
 }
 
 type MatchRepository interface {
@@ -546,6 +549,10 @@ func (m *sharedRepository) processEventMatchesForTarget(ctx context.Context, tx 
 	satisfiedMatches := make([]*sqlcv1.SaveSatisfiedMatchConditionsRow, 0)
 
 	if len(satisfiedMatchIds) > 0 {
+		if err := sqlchelpers.DisableJITForTransaction(ctx, tx); err != nil {
+			return nil, err
+		}
+
 		satisfiedMatches, err = m.queries.SaveSatisfiedMatchConditions(
 			ctx,
 			tx,
@@ -795,6 +802,7 @@ func (m *sharedRepository) processEventMatchesForTarget(ctx context.Context, tx 
 	errorMessages := make([]string, 0)
 	payloadsToStore := make([]StorePayloadOpts, 0)
 	idInsertedAtNodeIdToSatisfiedEntry := make(map[DurableTaskNodeIdKey]SatisfiedEntry)
+	minDurableTaskInsertedAt := time.Time{}
 
 	for _, match := range satisfiedMatches {
 		durableTaskExternalId := match.SignalTaskExternalID
@@ -843,16 +851,21 @@ func (m *sharedRepository) processEventMatchesForTarget(ctx context.Context, tx 
 			}
 
 			errorMessages = append(errorMessages, errorMsgToInsert)
+
+			if minDurableTaskInsertedAt.IsZero() || durableTaskInsertedAt.Time.Before(minDurableTaskInsertedAt) {
+				minDurableTaskInsertedAt = durableTaskInsertedAt.Time
+			}
 		}
 	}
 
 	entries, err := m.queries.UpdateDurableEventLogEntriesSatisfied(ctx, tx, sqlcv1.UpdateDurableEventLogEntriesSatisfiedParams{
-		Nodeids:                durableTaskNodeIds,
-		Branchids:              durableTaskBranchIds,
-		Durabletaskids:         durableTaskIds,
-		Durabletaskinsertedats: durableTaskInsertedAts,
-		Childtaskisfailures:    isFailures,
-		Childtaskerrormessages: errorMessages,
+		Nodeids:                  durableTaskNodeIds,
+		Branchids:                durableTaskBranchIds,
+		Durabletaskids:           durableTaskIds,
+		Durabletaskinsertedats:   durableTaskInsertedAts,
+		Childtaskisfailures:      isFailures,
+		Childtaskerrormessages:   errorMessages,
+		Mindurabletaskinsertedat: sqlchelpers.TimestamptzFromTime(minDurableTaskInsertedAt),
 	})
 
 	if err != nil {

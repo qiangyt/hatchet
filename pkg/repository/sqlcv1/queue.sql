@@ -77,9 +77,11 @@ LEFT JOIN
     tenant_actions ta ON ta."id" = wa.action_id;
 
 -- name: ListActionsForWorkersLegacyFallback :many
--- Fallback for workers registered before actionHash existed; expands the full
--- worker<>action join per worker. Prefer the hash-cached path in the
--- assignment repository (ListLiveWorkerActionHashes + ListWorkerActionSets).
+-- Fallback for workers without an actionHash: workers registered before the column existed,
+-- and operator workers whose hash is NULL because a delta changed their links and the
+-- refresh at the end of the delta sequence has not run yet. Expands the full worker<>action
+-- join per worker. Prefer the hash-cached path in the assignment repository
+-- (ListLiveWorkerActionHashes + ListWorkerActionSets).
 SELECT
     w."id" as "workerId",
     a."actionId"
@@ -249,12 +251,14 @@ WITH input AS (
     SELECT
         id,
         inserted_at,
+        retry_count,
         worker_id
     FROM
         (
             SELECT
                 UNNEST(@taskIds::bigint[]) AS id,
                 UNNEST(@taskInsertedAts::timestamptz[]) AS inserted_at,
+                UNNEST(@taskRetryCounts::integer[]) AS retry_count,
                 UNNEST(@workerIds::uuid[]) AS worker_id
         ) AS subquery
     ORDER BY id
@@ -272,7 +276,7 @@ WITH input AS (
     FROM
         v1_task t
     JOIN
-        input i ON (t.id, t.inserted_at) = (i.id, i.inserted_at)
+        input i ON (t.id, t.inserted_at, t.retry_count) = (i.id, i.inserted_at, i.retry_count)
     WHERE
         t.inserted_at >= @minTaskInsertedAt::timestamptz
     ORDER BY t.id
@@ -345,6 +349,7 @@ WHERE v1_task_runtime.evicted_at IS NOT NULL
 SELECT
     asr.task_id,
     asr.task_inserted_at,
+    asr.retry_count,
     asr.worker_id,
     ut.is_durable
 FROM
@@ -1350,6 +1355,8 @@ INSERT INTO v1_concurrency_slot (
     priority,
     key,
     next_keys,
+    max_runs,
+    next_max_runs,
     queue_to_notify,
     schedule_timeout_at
 )
@@ -1378,6 +1385,11 @@ SELECT
     CASE
         WHEN array_length(t.concurrency_keys, 1) > 1 THEN t.concurrency_keys[2:array_length(t.concurrency_keys, 1)]
         ELSE '{}'::text[]
+    END,
+    t.concurrency_max_runs[1],
+    CASE
+        WHEN array_length(t.concurrency_max_runs, 1) > 1 THEN t.concurrency_max_runs[2:array_length(t.concurrency_max_runs, 1)]
+        ELSE '{}'::integer[]
     END,
     t.queue,
     CURRENT_TIMESTAMP + convert_duration_to_interval(t.schedule_timeout)

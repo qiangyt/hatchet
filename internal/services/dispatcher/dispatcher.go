@@ -21,16 +21,15 @@ import (
 	"github.com/hatchet-dev/hatchet/internal/msgqueue"
 	"github.com/hatchet-dev/hatchet/internal/queueutils"
 	"github.com/hatchet-dev/hatchet/internal/services/dispatcher/contracts"
+	"github.com/hatchet-dev/hatchet/internal/services/dispatcher/contracts/contractsconnect"
 	"github.com/hatchet-dev/hatchet/internal/services/shared/recoveryutils"
 	"github.com/hatchet-dev/hatchet/internal/services/shared/streams"
 	tasktypesv1 "github.com/hatchet-dev/hatchet/internal/services/shared/tasktypes/v1"
 	"github.com/hatchet-dev/hatchet/internal/syncx"
 	"github.com/hatchet-dev/hatchet/pkg/analytics"
-	"github.com/hatchet-dev/hatchet/pkg/encryption"
 	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
 	"github.com/hatchet-dev/hatchet/pkg/logger"
 	"github.com/hatchet-dev/hatchet/pkg/operator"
-	"github.com/hatchet-dev/hatchet/pkg/operator/manager"
 	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
 	"github.com/hatchet-dev/hatchet/pkg/repository/cache"
 	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
@@ -42,12 +41,14 @@ import (
 )
 
 type Dispatcher interface {
-	contracts.DispatcherServer
+	contractsconnect.DispatcherHandler
 	Start() (func() error, error)
 }
 
+var _ contractsconnect.DispatcherHandler = (*DispatcherImpl)(nil)
+
 type DispatcherImpl struct {
-	contracts.UnimplementedDispatcherServer
+	contractsconnect.UnimplementedDispatcherHandler
 	v                                   validator.Validator
 	s                                   gocron.Scheduler
 	mqv1                                msgqueue.MessageQueue
@@ -67,7 +68,6 @@ type DispatcherImpl struct {
 	version                             string
 	defaultMaxWorkerLockAcquisitionTime time.Duration
 	streamEventBufferTimeout            time.Duration
-	om                                  *manager.OperatorManager
 	workflowRunBufferSize               int
 	payloadSizeThreshold                int
 	dispatcherId                        uuid.UUID
@@ -100,20 +100,20 @@ func (d *DispatcherImpl) CancelDAGChildren(ctx context.Context, tenantId uuid.UU
 var ErrWorkerNotFound = fmt.Errorf("worker not found")
 
 type workers struct {
-	innerMap syncx.Map[uuid.UUID, *syncx.Map[string, *subscribedWorker]]
+	innerMap syncx.Map[uuid.UUID, *syncx.Map[uuid.UUID, *subscribedWorker]]
 }
 
-func (w *workers) Range(f func(key uuid.UUID, value *syncx.Map[string, *subscribedWorker]) bool) {
+func (w *workers) Range(f func(key uuid.UUID, value *syncx.Map[uuid.UUID, *subscribedWorker]) bool) {
 	w.innerMap.Range(f)
 }
 
-func (w *workers) Add(workerId uuid.UUID, sessionId string, worker *subscribedWorker) {
-	actual, _ := w.innerMap.LoadOrStore(workerId, &syncx.Map[string, *subscribedWorker]{})
+func (w *workers) Add(workerId uuid.UUID, sessionId uuid.UUID, worker *subscribedWorker) {
+	actual, _ := w.innerMap.LoadOrStore(workerId, &syncx.Map[uuid.UUID, *subscribedWorker]{})
 
 	actual.Store(sessionId, worker)
 }
 
-func (w *workers) GetForSession(workerId uuid.UUID, sessionId string) (*subscribedWorker, error) {
+func (w *workers) GetForSession(workerId uuid.UUID, sessionId uuid.UUID) (*subscribedWorker, error) {
 	actual, ok := w.innerMap.Load(workerId)
 	if !ok {
 		return nil, ErrWorkerNotFound
@@ -136,7 +136,7 @@ func (w *workers) Get(workerId uuid.UUID) ([]*subscribedWorker, error) {
 
 	workers := []*subscribedWorker{}
 
-	actual.Range(func(key string, value *subscribedWorker) bool {
+	actual.Range(func(key uuid.UUID, value *subscribedWorker) bool {
 		workers = append(workers, value)
 		return true
 	})
@@ -144,7 +144,7 @@ func (w *workers) Get(workerId uuid.UUID) ([]*subscribedWorker, error) {
 	return workers, nil
 }
 
-func (w *workers) DeleteForSession(workerId uuid.UUID, sessionId string) {
+func (w *workers) DeleteForSession(workerId uuid.UUID, sessionId uuid.UUID) {
 	actual, ok := w.innerMap.Load(workerId)
 
 	if !ok {
@@ -174,9 +174,6 @@ type DispatcherOpts struct {
 	defaultMaxWorkerLockAcquisitionTime time.Duration
 	workflowRunBufferSize               int
 	streamEventBufferTimeout            time.Duration
-	enc                                 encryption.EncryptionService
-	infraBlockedCIDRs                   []string
-	dagOperatorDefaultSlots             int
 	dispatcherId                        uuid.UUID
 	promGate                            *prometheus.Gate
 }
@@ -243,24 +240,6 @@ func WithDispatcherId(dispatcherId uuid.UUID) DispatcherOpt {
 func WithCache(cache cache.Cacheable) DispatcherOpt {
 	return func(opts *DispatcherOpts) {
 		opts.cache = cache
-	}
-}
-
-func WithEncryption(enc encryption.EncryptionService) DispatcherOpt {
-	return func(opts *DispatcherOpts) {
-		opts.enc = enc
-	}
-}
-
-func WithInfraBlockedCIDRs(cidrs []string) DispatcherOpt {
-	return func(opts *DispatcherOpts) {
-		opts.infraBlockedCIDRs = cidrs
-	}
-}
-
-func WithDAGOperatorDefaultSlots(slots int) DispatcherOpt {
-	return func(opts *DispatcherOpts) {
-		opts.dagOperatorDefaultSlots = slots
 	}
 }
 
@@ -344,7 +323,6 @@ func New(fs ...DispatcherOpt) (*DispatcherImpl, error) {
 
 	pubBuffer := msgqueue.NewMQPubBuffer(opts.mqv1)
 
-	om := manager.NewOperatorManager(opts.dispatcherId, opts.l, opts.repov1, opts.enc, opts.infraBlockedCIDRs, opts.dagOperatorDefaultSlots)
 	v := validator.NewDefaultValidator()
 
 	return &DispatcherImpl{
@@ -367,7 +345,6 @@ func New(fs ...DispatcherOpt) (*DispatcherImpl, error) {
 		analytics:                           opts.analytics,
 		streamEventBufferTimeout:            opts.streamEventBufferTimeout,
 		version:                             opts.version,
-		om:                                  om,
 		refreshTimeoutBuf:                   newRefreshTimeoutBuffer(),
 		serviceV1:                           newDispatcherService(opts.repov1, opts.mqv1, opts.pubsub, v, opts.l, opts.dispatcherId, opts.analytics, opts.promGate),
 	}, nil
@@ -401,10 +378,6 @@ func (d *DispatcherImpl) Start() (func() error, error) {
 	}
 
 	d.s.Start()
-
-	operatorCh := d.om.Start(ctx, d)
-
-	go d.listenForOperators(operatorCh)
 
 	wg := sync.WaitGroup{}
 
@@ -441,11 +414,6 @@ func (d *DispatcherImpl) Start() (func() error, error) {
 
 		wg.Wait()
 
-		// drain the operators (waits for their in-flight tasks and stops their heartbeats);
-		// this runs after wg.Wait so in-flight queue tasks can still reach their operators,
-		// and before pubBuffer.Stop so draining operators can still flush result events
-		d.om.Cleanup()
-
 		d.pubBuffer.Stop()
 		d.serviceV1.pubBuffer.Stop()
 		d.refreshTimeoutBuf.stop()
@@ -453,17 +421,19 @@ func (d *DispatcherImpl) Start() (func() error, error) {
 		// drain the existing connections
 		d.l.Debug().Ctx(ctx).Msg("draining existing connections")
 
-		d.workers.Range(func(key uuid.UUID, value *syncx.Map[string, *subscribedWorker]) bool {
-			value.Range(func(key string, value *subscribedWorker) bool {
+		d.workers.Range(func(key uuid.UUID, value *syncx.Map[uuid.UUID, *subscribedWorker]) bool {
+			value.Range(func(key uuid.UUID, value *subscribedWorker) bool {
 				w := value
 
-				// operator-backed workers have no stream goroutine reading `finished`; the
-				// operator manager has already drained them above
-				if w.operator != nil {
+				// operator-backed workers have no stream goroutine reading `finished`: the
+				// host that opened the session owns their teardown, the in-process host for
+				// the operators the claimer runs and the operator service for the sessions
+				// it opens
+				if w.handler != nil {
 					return true
 				}
 
-				w.finished <- true
+				w.requestFin()
 
 				return true
 			})
@@ -490,54 +460,6 @@ func (d *DispatcherImpl) Start() (func() error, error) {
 	}
 
 	return cleanup, nil
-}
-
-// listenForOperators mirrors the manager's reported operator set into the workers map. Each
-// message carries the full set of active operators (resent every poll), so entries that
-// disappear from the set are removed — the dispatcher never accumulates routing entries for
-// operators that are no longer claimed by it.
-func (d *DispatcherImpl) listenForOperators(ch <-chan []operator.Operator) {
-	// workerId -> sessionId for the operator-backed entries this loop has added; only this
-	// goroutine touches it. operator workers are exclusive to their operator instance, so a
-	// stable session per worker is sufficient.
-	sessions := make(map[uuid.UUID]string)
-
-	for operators := range ch {
-		current := make(map[uuid.UUID]struct{}, len(operators))
-
-		for _, o := range operators {
-			workerId := o.WorkerId()
-			current[workerId] = struct{}{}
-
-			if _, ok := sessions[workerId]; ok {
-				continue
-			}
-
-			sessionId := uuid.NewString()
-			sessions[workerId] = sessionId
-
-			d.workers.Add(
-				workerId,
-				sessionId,
-				// nil finished channel: operator workers have no stream goroutine to signal,
-				// and the shutdown drain skips them (the operator manager owns their teardown)
-				newOperatorSubscribedWorker(
-					workerId,
-					d.pubBuffer,
-					o,
-				),
-			)
-		}
-
-		for workerId := range sessions {
-			if _, ok := current[workerId]; ok {
-				continue
-			}
-
-			delete(sessions, workerId)
-			d.workers.Delete(workerId)
-		}
-	}
 }
 
 func (d *DispatcherImpl) handleV1Task(ctx context.Context, task *msgqueue.Message) (err error) {
@@ -574,6 +496,8 @@ func (d *DispatcherImpl) DispatcherId() uuid.UUID {
 func (d *DispatcherImpl) handleDurableCallbackCompleted(ctx context.Context, task *msgqueue.Message) error {
 	payloads := msgqueue.JSONConvert[tasktypesv1.DurableCallbackCompletedPayload](task.Payloads)
 
+	undelivered := make([]tasktypesv1.DurableCallbackCompletedPayload, 0)
+
 	for _, payload := range payloads {
 		err := d.serviceV1.DeliverDurableEventLogEntryCompletion(
 			task.TenantID,
@@ -588,8 +512,23 @@ func (d *DispatcherImpl) handleDurableCallbackCompleted(ctx context.Context, tas
 		)
 
 		if err != nil {
-			d.l.Warn().Err(err).Msgf("failed to deliver callback completion for task %s (worker may still be reconnecting; polling path will catch up)", payload.TaskExternalId)
+			d.l.Warn().Err(err).Msgf("could not deliver callback completion for task %s; redelivering via the dead-letter queue", payload.TaskExternalId)
+			undelivered = append(undelivered, *payload)
 		}
+	}
+
+	if len(undelivered) == 0 {
+		return nil
+	}
+
+	msg, err := msgqueue.NewTenantMessage(task.TenantID, msgqueue.MsgIDDurableCallbackCompleted, false, true, undelivered...)
+
+	if err != nil {
+		return fmt.Errorf("could not create dead-letter message for undelivered durable callbacks: %w", err)
+	}
+
+	if err := d.mqv1.SendMessage(ctx, msgqueue.DISPATCHER_DEAD_LETTER_QUEUE, msg); err != nil {
+		return fmt.Errorf("could not publish undelivered durable callbacks to the dead-letter queue: %w", err)
 	}
 
 	return nil
@@ -678,7 +617,7 @@ func (d *DispatcherImpl) handleTaskBulkAssignedTask(ctx context.Context, msg *ms
 func (d *DispatcherImpl) GetLocalWorkerIds() map[uuid.UUID]struct{} {
 	workerIds := make(map[uuid.UUID]struct{})
 
-	d.workers.Range(func(workerId uuid.UUID, value *syncx.Map[string, *subscribedWorker]) bool {
+	d.workers.Range(func(workerId uuid.UUID, value *syncx.Map[uuid.UUID, *subscribedWorker]) bool {
 		workerIds[workerId] = struct{}{}
 
 		return true
