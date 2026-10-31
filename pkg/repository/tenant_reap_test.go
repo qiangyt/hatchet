@@ -5,6 +5,7 @@ package repository
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,15 +41,15 @@ func TestReapTenantDataRemovesAllTenantRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, tenantCount, "the tenant row itself must be hard-deleted")
 
-	// Every remaining table with a tenantId column must hold zero rows for
+	// Every remaining table with a tenant column must hold zero rows for
 	// the reaped tenant. The table list is discovered dynamically, so new
 	// tables are covered automatically.
-	for _, table := range softDeleteTestTablesTenantIdColumn(t, pool) {
+	for _, table := range softDeleteTestTablesWithTenantColumn(t, pool) {
 		var count int
 		err := pool.QueryRow(ctx(t),
-			`SELECT count(*) FROM `+quoteIdent(table)+` WHERE "tenantId" = $1`, tenantId).Scan(&count)
-		require.NoError(t, err, "failed to check table %s", table)
-		assert.Zero(t, count, "table %s must hold no rows for the reaped tenant", table)
+			`SELECT count(*) FROM `+quoteIdent(table.name)+` WHERE `+quoteIdent(table.column)+` = $1`, tenantId).Scan(&count)
+		require.NoError(t, err, "failed to check table %s", table.name)
+		assert.Zero(t, count, "table %s must hold no rows for the reaped tenant", table.name)
 	}
 }
 
@@ -84,29 +85,37 @@ func TestListSoftDeletedTenantsBeforeFiltersByGracePeriod(t *testing.T) {
 	assert.False(t, ids[recentTenantId], "recently soft-deleted tenant is within the grace period")
 }
 
-// softDeleteTestTablesTenantIdColumn returns all public-schema tables that
-// carry a tenantId column (the Tenant table has no such column and is
-// naturally excluded).
-func softDeleteTestTablesTenantIdColumn(t *testing.T, pool *pgxpool.Pool) []string {
+// softDeleteTestTablesWithTenantColumn returns all public-schema tables that
+// carry a tenant column, paired with the column's actual name — both the v0
+// camelCase "tenantId" and the v1 snake_case "tenant_id" spellings (the
+// Tenant table has no such column and is naturally excluded). Partitioned
+// parents are included and their children excluded, mirroring the reap's own
+// discovery: a count through the parent reads every child partition.
+func softDeleteTestTablesWithTenantColumn(t *testing.T, pool *pgxpool.Pool) []tenantTable {
 	t.Helper()
 
 	rows, err := pool.Query(ctx(t), `
-		SELECT table_name
-		FROM information_schema.columns
-		WHERE table_schema = 'public' AND column_name = 'tenantId'
-		ORDER BY table_name
+		SELECT cls.relname, min(c.attname)
+		FROM pg_attribute c
+		JOIN pg_class cls ON cls.oid = c.attrelid
+		WHERE cls.relnamespace = 'public'::regnamespace
+		  AND cls.relkind IN ('r', 'p')
+		  AND cls.relispartition = false
+		  AND c.attname IN ('tenantId', 'tenant_id')
+		GROUP BY cls.relname
+		ORDER BY cls.relname
 	`)
 	require.NoError(t, err)
 	defer rows.Close()
 
-	var tables []string
+	var tables []tenantTable
 	for rows.Next() {
-		var table string
-		require.NoError(t, rows.Scan(&table))
+		var table tenantTable
+		require.NoError(t, rows.Scan(&table.name, &table.column))
 		tables = append(tables, table)
 	}
 	require.NoError(t, rows.Err())
-	require.NotEmpty(t, tables, "the schema must contain tables with a tenantId column")
+	require.NotEmpty(t, tables, "the schema must contain tables with a tenant column")
 	return tables
 }
 
@@ -424,7 +433,7 @@ func TestTenantIdTablesInDeleteOrder(t *testing.T) {
 
 	position := make(map[string]int, len(tables))
 	for i, table := range tables {
-		position[table] = i
+		position[table.name] = i
 	}
 
 	// The authoritative pair set, derived from the live catalog (2026-09-30
@@ -514,4 +523,373 @@ func TestReapTenantDataDeletesChildrenBeforeParents(t *testing.T) {
 		require.NoError(t, err, "failed to check table %s", table)
 		assert.Zero(t, count, "table %s must hold no rows for the reaped tenant", table)
 	}
+}
+
+// TestTenantIdTablesDiscoversSnakeCaseTables is the regression test for the
+// v1-family leak: every v1 table names its tenant column "tenant_id"
+// (snake_case), while the discovery query only ever matched the v0 spelling
+// "tenantId". The whole v1 family — v1_step_concurrency,
+// v1_tenant_concurrency, v1_concurrency_slot, v1_task, … — was therefore
+// invisible to the reap, and soft-deleted tenants accumulated orphan rows in
+// those tables forever (v1_step_concurrency alone grew ~108-180 rows per full
+// qc e2e round on the production meta DB). Discovery must report each table
+// with its actual column name so the DELETE targets the right column.
+func TestTenantIdTablesDiscoversSnakeCaseTables(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	tables, err := tenantIdTablesInDeleteOrder(ctx(t), pool)
+	require.NoError(t, err)
+
+	byName := make(map[string]string, len(tables))
+	for _, table := range tables {
+		byName[table.name] = table.column
+	}
+
+	// Representative non-partitioned v1 tables (metadata that accumulates
+	// orphans) and the two concurrency tables at the heart of the leak.
+	for _, name := range []string{
+		"v1_step_concurrency",
+		"v1_tenant_concurrency",
+		"v1_concurrency_slot",
+		"v1_workflow_concurrency",
+		"v1_workflow_concurrency_slot",
+	} {
+		column, ok := byName[name]
+		require.True(t, ok, "v1 table %s carries a tenant_id column and must be discovered", name)
+		assert.Equal(t, "tenant_id", column, "table %s must report its actual tenant column", name)
+	}
+
+	// v0 tables keep reporting the camelCase column.
+	column, ok := byName["Worker"]
+	require.True(t, ok, "v0 table Worker must still be discovered")
+	assert.Equal(t, "tenantId", column, "v0 tables keep the camelCase tenant column")
+}
+
+// TestTenantIdTablesIncludesPartitionedParentsExcludesChildren pins the
+// partition handling: declarative-partitioned parents (relkind 'p') carry a
+// tenant column too and must be reaped, but exactly once — PostgreSQL routes a
+// DELETE on the parent to every child partition, so emitting one DELETE per
+// daily child would multiply the work by the partition count (hundreds of
+// statements against the OLAP tables). Partition children must not enter the
+// list at all.
+func TestTenantIdTablesIncludesPartitionedParentsExcludesChildren(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	// A synthetic partitioned family mirroring the real v1 shape: one parent
+	// with a snake_case tenant column, three daily children. The reap must see
+	// the parent once and the children never.
+	_, err := pool.Exec(ctx(t), `
+		CREATE TABLE "zz_reap_partitioned" (
+		    "id" UUID NOT NULL,
+		    "tenant_id" UUID NOT NULL,
+		    "inserted_at" TIMESTAMPTZ NOT NULL,
+		    CONSTRAINT "zz_reap_partitioned_pkey" PRIMARY KEY ("id", "inserted_at")
+		) PARTITION BY RANGE ("inserted_at")
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx(t), `DROP TABLE IF EXISTS "zz_reap_partitioned"`)
+	})
+
+	for _, month := range []string{"2026-10", "2026-11", "2026-12"} {
+		_, err = pool.Exec(ctx(t), fmt.Sprintf(`
+			CREATE TABLE "zz_reap_partitioned_%s" PARTITION OF "zz_reap_partitioned"
+			FOR VALUES FROM ('%s-01') TO ('%s-01'::timestamptz + INTERVAL '1 month')
+		`, month, month, month))
+		require.NoError(t, err)
+	}
+
+	tables, err := tenantIdTablesInDeleteOrder(ctx(t), pool)
+	require.NoError(t, err)
+
+	seen := make(map[string]int, len(tables))
+	for _, table := range tables {
+		seen[table.name]++
+	}
+
+	// The synthetic parent is discovered exactly once, with its real column.
+	assert.Equal(t, 1, seen["zz_reap_partitioned"],
+		"a partitioned parent must be discovered exactly once")
+	for _, child := range []string{
+		"zz_reap_partitioned_2026-10",
+		"zz_reap_partitioned_2026-11",
+		"zz_reap_partitioned_2026-12",
+	} {
+		assert.Zero(t, seen[child],
+			"partition child %s must not be discovered: the parent DELETE routes to it", child)
+	}
+
+	// Real partitioned v1 parents are discovered exactly once as well.
+	for _, name := range []string{"v1_task", "v1_dag", "v1_events_olap", "v1_tasks_olap"} {
+		assert.Equal(t, 1, seen[name], "real partitioned parent %s must be discovered exactly once", name)
+	}
+
+	// Belt and braces: nothing in the list may be a partition child of any
+	// table, whatever it is named.
+	rows, err := pool.Query(ctx(t), `
+		SELECT relname FROM pg_class
+		WHERE relnamespace = 'public'::regnamespace AND relispartition
+	`)
+	require.NoError(t, err)
+	var children []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		children = append(children, name)
+	}
+	require.NoError(t, rows.Err())
+	require.NotEmpty(t, children, "the migrated schema must contain partition children")
+	for _, child := range children {
+		assert.Zero(t, seen[child], "partition child %s must never enter the reap list", child)
+	}
+}
+
+// TestTenantIdTablesDeduplicatesDualColumnTable pins the dedup rule: a table
+// carrying both spellings must enter the list exactly once, and the column
+// choice must be fixed rather than arbitrary. The real schema has no such
+// table (verified against the migrated catalog), so this is a determinism
+// guard for future migrations, not a description of current data.
+func TestTenantIdTablesDeduplicatesDualColumnTable(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	_, err := pool.Exec(ctx(t), `
+		CREATE TABLE "zz_reap_dual_column" (
+		    "id" UUID NOT NULL,
+		    "tenantId" UUID NOT NULL,
+		    "tenant_id" UUID NOT NULL,
+		    CONSTRAINT "zz_reap_dual_column_pkey" PRIMARY KEY ("id")
+		)
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx(t), `DROP TABLE IF EXISTS "zz_reap_dual_column"`)
+	})
+
+	// Two consecutive discoveries must agree — the rule is deterministic, not
+	// dependent on catalog scan order.
+	var columns []string
+	for i := 0; i < 2; i++ {
+		tables, err := tenantIdTablesInDeleteOrder(ctx(t), pool)
+		require.NoError(t, err)
+
+		seen := 0
+		for _, table := range tables {
+			if table.name == "zz_reap_dual_column" {
+				seen++
+				columns = append(columns, table.column)
+			}
+		}
+		require.Equal(t, 1, seen, "a dual-column table must enter the list exactly once (run %d)", i)
+	}
+
+	require.Len(t, columns, 2)
+	assert.Equal(t, columns[0], columns[1], "the column choice must be deterministic across runs")
+	assert.Equal(t, "tenantId", columns[0],
+		"when both spellings exist the v0 column wins, deterministically")
+}
+
+// TestReapTenantDataDeletesSnakeCaseTenantRows is the end-to-end behavior
+// test for the v1 family: a soft-deleted tenant's v1_step_concurrency,
+// v1_tenant_concurrency and partitioned v1-family rows must be reaped, while
+// an active tenant and a tenant that is soft-deleted but still awaiting its
+// grace period keep every row. It also pins that the reap never touches
+// identity sequences (v1_tenant_concurrency borrows v1_step_concurrency's
+// sequence, so a reset would collide future inserts) and that the
+// v1_step_concurrency → v1_tenant_concurrency foreign key is respected
+// children-first.
+func TestReapTenantDataDeletesSnakeCaseTenantRows(t *testing.T) {
+	pool, cleanup := setupPostgresWithMigration(t)
+	defer cleanup()
+
+	tenantRepo := createSoftDeleteTestTenantRepository(pool)
+
+	reapedTenantId := insertSoftDeleteTestTenant(t, pool, "reap-v1-target")
+	awaitingTenantId := insertSoftDeleteTestTenant(t, pool, "reap-v1-awaiting")
+	activeTenantId := insertSoftDeleteTestTenant(t, pool, "reap-v1-active")
+
+	// A partitioned v1-family table with daily children, mirroring the real
+	// OLAP/v1_task shape: the reap must clear the reaped tenant's rows via a
+	// single parent DELETE that PostgreSQL routes to every child.
+	_, err := pool.Exec(ctx(t), `
+		CREATE TABLE "zz_reap_v1_partitioned" (
+		    "id" UUID NOT NULL,
+		    "tenant_id" UUID NOT NULL,
+		    "inserted_at" TIMESTAMPTZ NOT NULL,
+		    CONSTRAINT "zz_reap_v1_partitioned_pkey" PRIMARY KEY ("id", "inserted_at")
+		) PARTITION BY RANGE ("inserted_at")
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx(t), `DROP TABLE IF EXISTS "zz_reap_v1_partitioned"`)
+	})
+	for _, month := range []string{"2026-10", "2026-11"} {
+		_, err = pool.Exec(ctx(t), fmt.Sprintf(`
+			CREATE TABLE "zz_reap_v1_partitioned_%s" PARTITION OF "zz_reap_v1_partitioned"
+			FOR VALUES FROM ('%s-01') TO ('%s-01'::timestamptz + INTERVAL '1 month')
+		`, month, month, month))
+		require.NoError(t, err)
+	}
+	// Two rows per tenant, one per partition, so a parent-only delete that
+	// fails to route to children leaves visible residue.
+	for _, tenantId := range []uuid.UUID{reapedTenantId, awaitingTenantId, activeTenantId} {
+		for _, day := range []string{"2026-10-15", "2026-11-15"} {
+			_, err = pool.Exec(ctx(t), `
+				INSERT INTO "zz_reap_v1_partitioned" ("id", "tenant_id", "inserted_at")
+				VALUES ($1, $2, $3)
+			`, uuid.New(), tenantId, day)
+			require.NoError(t, err)
+		}
+	}
+
+	// v1_tenant_concurrency first: v1_step_concurrency references it via
+	// tenant_strategy_id (ON DELETE NO ACTION), so the reap must delete the
+	// step rows before the tenant-concurrency rows.
+	for _, tenantId := range []uuid.UUID{reapedTenantId, awaitingTenantId, activeTenantId} {
+		insertSoftDeleteTestV1TenantConcurrency(t, pool, tenantId, "strategy-"+tenantId.String())
+		insertSoftDeleteTestV1StepConcurrency(t, pool, tenantId, nil)
+	}
+	// Wire the reaped tenant's step row to its tenant strategy, exercising the
+	// children-first order across the new v1 tables.
+	stepStrategyId := softDeleteTestV1StepConcurrencyStrategyId(t, pool, reapedTenantId)
+	tenantStrategyId := softDeleteTestV1TenantConcurrencyId(t, pool, reapedTenantId)
+	_, err = pool.Exec(ctx(t),
+		`UPDATE v1_step_concurrency SET tenant_strategy_id = $1 WHERE id = $2`,
+		tenantStrategyId, stepStrategyId)
+	require.NoError(t, err)
+
+	var sequenceBefore int64
+	sequenceBefore = softDeleteTestIdentitySequenceValue(t, pool, "v1_step_concurrency", "id")
+
+	require.NoError(t, tenantRepo.DeleteTenant(ctx(t), reapedTenantId))
+	require.NoError(t, tenantRepo.DeleteTenant(ctx(t), awaitingTenantId))
+
+	err = tenantRepo.ReapTenantData(ctx(t), reapedTenantId)
+	require.NoError(t, err)
+
+	// The reaped tenant's v1 rows are gone — including the partitioned family,
+	// where the count reads through the parent (all children).
+	for _, table := range []string{
+		"v1_step_concurrency", "v1_tenant_concurrency", "zz_reap_v1_partitioned",
+	} {
+		var count int
+		err = pool.QueryRow(ctx(t),
+			`SELECT count(*) FROM `+quoteIdent(table)+` WHERE tenant_id = $1`, reapedTenantId).Scan(&count)
+		require.NoError(t, err, "failed to check table %s", table)
+		assert.Zero(t, count, "table %s must hold no rows for the reaped tenant", table)
+	}
+
+	// The soft-deleted-but-awaiting tenant keeps every row: its Tenant row
+	// still exists, so its data is not an orphan yet.
+	assert.Equal(t, 1, softDeleteTestV1RowCount(t, pool, "v1_step_concurrency", awaitingTenantId),
+		"the awaiting tenant's step-concurrency row must survive")
+	assert.Equal(t, 1, softDeleteTestV1RowCount(t, pool, "v1_tenant_concurrency", awaitingTenantId),
+		"the awaiting tenant's tenant-concurrency row must survive")
+	assert.Equal(t, 2, softDeleteTestV1RowCount(t, pool, "zz_reap_v1_partitioned", awaitingTenantId),
+		"the awaiting tenant's partitioned rows (one per child) must survive")
+
+	// The active tenant keeps every row.
+	assert.Equal(t, 1, softDeleteTestV1RowCount(t, pool, "v1_step_concurrency", activeTenantId),
+		"the active tenant's step-concurrency row must survive")
+	assert.Equal(t, 1, softDeleteTestV1RowCount(t, pool, "v1_tenant_concurrency", activeTenantId),
+		"the active tenant's tenant-concurrency row must survive")
+	assert.Equal(t, 2, softDeleteTestV1RowCount(t, pool, "zz_reap_v1_partitioned", activeTenantId),
+		"the active tenant's partitioned rows (one per child) must survive")
+
+	var reapedTenantCount, awaitingTenantCount int
+	require.NoError(t, pool.QueryRow(ctx(t), `SELECT count(*) FROM "Tenant" WHERE "id" = $1`, reapedTenantId).Scan(&reapedTenantCount))
+	require.NoError(t, pool.QueryRow(ctx(t), `SELECT count(*) FROM "Tenant" WHERE "id" = $1`, awaitingTenantId).Scan(&awaitingTenantCount))
+	assert.Zero(t, reapedTenantCount, "the reaped tenant row is hard-deleted")
+	assert.Equal(t, 1, awaitingTenantCount, "the awaiting tenant row survives the reap")
+
+	// The shared identity sequence is untouched: a fresh insert must draw an id
+	// beyond the pre-reap position, proving no RESTART IDENTITY happened.
+	insertSoftDeleteTestV1StepConcurrency(t, pool, activeTenantId, nil)
+	sequenceAfter := softDeleteTestIdentitySequenceValue(t, pool, "v1_step_concurrency", "id")
+	assert.Greater(t, sequenceAfter, sequenceBefore,
+		"the identity sequence must advance past its pre-reap value, never reset")
+}
+
+// insertSoftDeleteTestV1TenantConcurrency inserts a tenant-scoped concurrency
+// strategy row (v1 family, snake_case tenant column).
+func insertSoftDeleteTestV1TenantConcurrency(t *testing.T, pool *pgxpool.Pool, tenantId uuid.UUID, name string) {
+	t.Helper()
+
+	_, err := pool.Exec(ctx(t), `
+		INSERT INTO v1_tenant_concurrency ("tenant_id", "name", "strategy", "expression", "max_concurrency")
+		VALUES ($1, $2, 'GROUP_ROUND_ROBIN', '1', 1)
+	`, tenantId, name)
+	require.NoError(t, err)
+}
+
+// insertSoftDeleteTestV1StepConcurrency inserts a per-step concurrency row
+// (v1 family, snake_case tenant column).
+func insertSoftDeleteTestV1StepConcurrency(t *testing.T, pool *pgxpool.Pool, tenantId uuid.UUID, tenantStrategyId *int64) {
+	t.Helper()
+
+	_, err := pool.Exec(ctx(t), `
+		INSERT INTO v1_step_concurrency
+		    ("parent_strategy_id", "workflow_id", "workflow_version_id", "step_id",
+		     "strategy", "expression", "tenant_id", "max_concurrency", "tenant_strategy_id")
+		VALUES (NULL, $1, $1, $2, 'GROUP_ROUND_ROBIN', '1', $3, 1, $4)
+	`, uuid.New(), uuid.New(), tenantId, tenantStrategyId)
+	require.NoError(t, err)
+}
+
+func softDeleteTestV1RowCount(t *testing.T, pool *pgxpool.Pool, table string, tenantId uuid.UUID) int {
+	t.Helper()
+
+	var count int
+	err := pool.QueryRow(ctx(t),
+		`SELECT count(*) FROM `+quoteIdent(table)+` WHERE tenant_id = $1`, tenantId).Scan(&count)
+	require.NoError(t, err, "failed to count table %s", table)
+	return count
+}
+
+func softDeleteTestV1TenantConcurrencyId(t *testing.T, pool *pgxpool.Pool, tenantId uuid.UUID) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(ctx(t),
+		`SELECT id FROM v1_tenant_concurrency WHERE tenant_id = $1`, tenantId).Scan(&id)
+	require.NoError(t, err)
+	return id
+}
+
+func softDeleteTestV1StepConcurrencyStrategyId(t *testing.T, pool *pgxpool.Pool, tenantId uuid.UUID) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(ctx(t),
+		`SELECT id FROM v1_step_concurrency WHERE tenant_id = $1`, tenantId).Scan(&id)
+	require.NoError(t, err)
+	return id
+}
+
+// softDeleteTestIdentitySequenceValue returns the current last_value of the
+// sequence backing an identity column, so a test can prove the reap never
+// reset it.
+func softDeleteTestIdentitySequenceValue(t *testing.T, pool *pgxpool.Pool, table, column string) int64 {
+	t.Helper()
+
+	var sequenceName string
+	err := pool.QueryRow(ctx(t),
+		`SELECT pg_get_serial_sequence($1, $2)`, table, column).Scan(&sequenceName)
+	require.NoError(t, err)
+	require.NotEmpty(t, sequenceName, "table %s column %s must be backed by a sequence", table, column)
+
+	// pg_get_serial_sequence returns a schema-qualified name; quote each part
+	// separately so the dot stays a schema separator.
+	schema, name, found := strings.Cut(sequenceName, ".")
+	if !found {
+		schema, name = "public", sequenceName
+	}
+	qualified := quoteIdent(schema) + "." + quoteIdent(name)
+
+	var value int64
+	err = pool.QueryRow(ctx(t), `SELECT last_value FROM `+qualified).Scan(&value)
+	require.NoError(t, err)
+	return value
 }

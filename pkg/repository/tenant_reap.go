@@ -31,8 +31,8 @@ func (r *tenantRepository) ListSoftDeletedTenantsBefore(ctx context.Context, bef
 }
 
 // ReapTenantData hard-deletes every row owned by the tenant across all
-// tables with a tenantId column, then deletes the tenant row itself.
-// Tables whose tenantId foreign key cascades from the tenant row delete are
+// tables with a tenant column, then deletes the tenant row itself.
+// Tables whose tenant foreign key cascades from the tenant row delete are
 // covered by the final delete; the explicit per-table deletes cover the
 // rest. The table list comes from the database catalog, so new tables are
 // covered automatically; the list is ordered children-first over the FK
@@ -69,10 +69,26 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 		return err
 	}
 
+	// One DELETE per table, through the tenant column that table actually
+	// has. Partitioned parents are deleted once — PostgreSQL routes the
+	// statement to every child partition, so the daily OLAP partitions are
+	// never enumerated individually.
 	for _, table := range tables {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE "tenantId" = $1`, quoteTable(table)), tenantId); err != nil {
-			return fmt.Errorf("could not delete rows from %s: %w", table, err)
+		column, err := quoteTenantColumn(table.column)
+		if err != nil {
+			return fmt.Errorf("could not delete rows from %s: %w", table.name, err)
 		}
+
+		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s = $1`, quoteTable(table.name), column), tenantId)
+		if err != nil {
+			return fmt.Errorf("could not delete rows from %s: %w", table.name, err)
+		}
+
+		r.l.Debug().Ctx(ctx).
+			Str("tenant_id", tenantId.String()).
+			Str("table", table.name).
+			Int64("rows", tag.RowsAffected()).
+			Msg("reaped tenant rows")
 	}
 
 	rows, err := r.queries.HardDeleteTenant(ctx, tx, tenantId)
@@ -90,10 +106,42 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 	return nil
 }
 
-// tenantIdTablesInDeleteOrder lists public-schema tables that carry a
-// tenantId column, ordered so that referencing (child) tables come before
-// the tables they reference (parents). The list comes from the database
-// catalog, so it never goes stale.
+// tenantTable pairs a tenant-scoped table with the name of its actual tenant
+// column. v0 tables spell the column "tenantId" (camelCase); the entire v1
+// family spells it "tenant_id" (snake_case). The reap must delete through the
+// column the table really has — matching only one spelling silently skipped
+// every v1 table, which is how soft-deleted tenants accumulated orphan rows
+// in v1_step_concurrency and the rest of the v1 family.
+type tenantTable struct {
+	name   string
+	column string
+}
+
+// quoteTenantColumn quotes a tenant column name for SQL, refusing anything
+// outside the two known spellings. The discovery query already constrains
+// attname to that set; this guard keeps an unvalidated catalog value from
+// reaching SQL if that query is ever edited.
+func quoteTenantColumn(name string) (string, error) {
+	switch name {
+	case "tenantId", "tenant_id":
+		return `"` + name + `"`, nil
+	default:
+		return "", fmt.Errorf("unexpected tenant column name %q", name)
+	}
+}
+
+// tenantIdTablesInDeleteOrder lists public-schema tables that carry a tenant
+// column, ordered so that referencing (child) tables come before the tables
+// they reference (parents). The list comes from the database catalog, so it
+// never goes stale.
+//
+// Both tenant-column spellings are matched: "tenantId" (v0) and "tenant_id"
+// (the whole v1 family). Declarative-partitioned tables are included through
+// their parent (relkind 'p') and their children are excluded
+// (relispartition) — a DELETE on the parent is routed by PostgreSQL to every
+// child partition, so enumerating children would emit one statement per daily
+// partition. A table carrying both spellings enters the list once; the
+// camelCase column wins, deterministically (min(attname)).
 //
 // Why ordering matters: enforcement-mode FKs (ON DELETE RESTRICT checks
 // immediately, NO ACTION checks at statement end) make a parent-table delete
@@ -117,16 +165,18 @@ func (r *tenantRepository) ReapTenantData(ctx context.Context, tenantId uuid.UUI
 // order. OIDs are version-stable.
 func tenantIdTablesInDeleteOrder(ctx context.Context, q interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-}) ([]string, error) {
+}) ([]tenantTable, error) {
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE
 		tenant_tables AS (
-		    SELECT DISTINCT c.attrelid AS oid
+		    SELECT c.attrelid AS oid, min(c.attname) AS tenant_column
 		    FROM pg_attribute c
 		    JOIN pg_class cls ON cls.oid = c.attrelid
 		    WHERE cls.relnamespace = 'public'::regnamespace
-		      AND cls.relkind = 'r'
-		      AND c.attname = 'tenantId'
+		      AND cls.relkind IN ('r', 'p')
+		      AND cls.relispartition = false
+		      AND c.attname IN ('tenantId', 'tenant_id')
+		    GROUP BY c.attrelid
 		),
 		blocking_edges AS (
 		    SELECT DISTINCT con.conrelid AS child,
@@ -145,10 +195,11 @@ func tenantIdTablesInDeleteOrder(ctx context.Context, q interface {
 		    JOIN tenant_tables tt ON tt.oid = e.child
 		    WHERE d.depth < 100
 		)
-		SELECT cls.relname
+		SELECT cls.relname, tt.tenant_column
 		FROM depths
 		JOIN pg_class cls ON cls.oid = depths.t
-		GROUP BY cls.oid, cls.relname, depths.t
+		JOIN tenant_tables tt ON tt.oid = depths.t
+		GROUP BY cls.oid, cls.relname, tt.tenant_column, depths.t
 		ORDER BY max(depths.depth) DESC, cls.relname ASC
 	`)
 	if err != nil {
@@ -156,10 +207,10 @@ func tenantIdTablesInDeleteOrder(ctx context.Context, q interface {
 	}
 	defer rows.Close()
 
-	var tables []string
+	var tables []tenantTable
 	for rows.Next() {
-		var table string
-		if err := rows.Scan(&table); err != nil {
+		var table tenantTable
+		if err := rows.Scan(&table.name, &table.column); err != nil {
 			return nil, fmt.Errorf("could not scan table name: %w", err)
 		}
 		tables = append(tables, table)

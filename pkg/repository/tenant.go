@@ -189,7 +189,8 @@ type TenantRepository interface {
 	ListSoftDeletedTenantsBefore(ctx context.Context, before time.Time, maxCount int) ([]*sqlcv1.Tenant, error)
 
 	// ReapTenantData hard-deletes all rows owned by the tenant across every
-	// table with a tenantId column, then the tenant row itself.
+	// table with a tenant column ("tenantId" or "tenant_id"), then the tenant
+	// row itself.
 	ReapTenantData(ctx context.Context, tenantId uuid.UUID) error
 
 	GetTenantUsageData(ctx context.Context, tenantId uuid.UUID) (*sqlcv1.GetTenantUsageDataRow, error)
