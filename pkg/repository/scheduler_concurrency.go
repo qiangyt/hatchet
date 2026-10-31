@@ -78,7 +78,12 @@ type ConcurrencyRepository interface {
 
 	RunConcurrencyStrategy(ctx context.Context, tenantId uuid.UUID, strategy *sqlcv1.V1StepConcurrency) (*RunConcurrencyResult, error)
 
-	DeactivateStaleStepConcurrency(ctx context.Context, tenantId uuid.UUID) error
+	// DeactivateStaleStepConcurrency retires step-scoped and tenant-scoped
+	// strategies that hold no slots and have been idle longer than the
+	// threshold. The threshold must exceed the 1-hour last_active_at refresh
+	// cache (the slot-insert trigger bumps last_active_at at most once per
+	// hour); the engine default 25h covers a 24h idle window plus that cache.
+	DeactivateStaleStepConcurrency(ctx context.Context, tenantId uuid.UUID, threshold time.Duration) error
 
 	ListTenantsWithManyStepConcurrencies(ctx context.Context, threshold int64) ([]*sqlcv1.ListTenantsWithManyStepConcurrenciesRow, error)
 
@@ -1483,12 +1488,22 @@ func (c *ConcurrencyRepositoryImpl) upsertQueuesForQueuedTasks(ctx context.Conte
 	return nil
 }
 
-func (c *ConcurrencyRepositoryImpl) DeactivateStaleStepConcurrency(ctx context.Context, tenantId uuid.UUID) error {
-	if err := c.queries.DeactivateStaleStepConcurrency(ctx, c.pool, tenantId); err != nil {
+func (c *ConcurrencyRepositoryImpl) DeactivateStaleStepConcurrency(ctx context.Context, tenantId uuid.UUID, threshold time.Duration) error {
+	// both twins share one threshold: the staleness semantics of step-scoped
+	// and tenant-scoped strategies are identical
+	params := sqlcv1.DeactivateStaleStepConcurrencyParams{
+		Tenantid:         tenantId,
+		Thresholdseconds: int64(threshold / time.Second),
+	}
+
+	if err := c.queries.DeactivateStaleStepConcurrency(ctx, c.pool, params); err != nil {
 		return err
 	}
 
-	return c.queries.DeactivateStaleTenantConcurrency(ctx, c.pool, tenantId)
+	return c.queries.DeactivateStaleTenantConcurrency(ctx, c.pool, sqlcv1.DeactivateStaleTenantConcurrencyParams{
+		Tenantid:         tenantId,
+		Thresholdseconds: params.Thresholdseconds,
+	})
 }
 
 func (c *ConcurrencyRepositoryImpl) ListTenantsWithManyStepConcurrencies(ctx context.Context, threshold int64) ([]*sqlcv1.ListTenantsWithManyStepConcurrenciesRow, error) {

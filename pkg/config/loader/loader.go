@@ -1006,6 +1006,8 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 		EnableDataRetention:    cf.EnableDataRetention,
 		EnableWorkerRetention:  cf.EnableWorkerRetention,
 
+		StaleConcurrencyDeactivationThreshold: cf.StaleConcurrencyDeactivationThreshold,
+
 		EnableSoftDeleteTenantReap:      cf.EnableSoftDeleteTenantReap,
 		SoftDeleteTenantReapGracePeriod: cf.SoftDeleteTenantReapGracePeriod,
 		SoftDeleteTenantReapInterval:    cf.SoftDeleteTenantReapInterval,

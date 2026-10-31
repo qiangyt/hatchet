@@ -28,11 +28,15 @@ tag/VERSION 分离（2026-09-28 拍板）：
   ../venv/bin/python build-image.py                # 裸跑：upstream 取 CHANGELOG.md 顶部版本，fork-rev 缺省 4
   ../venv/bin/python build-image.py --fork-rev 5 --push
   ../venv/bin/python build-image.py --upstream-version v0.105.16 --fork-rev 3   # 显式覆盖（CI/特殊场景）
+  ../venv/bin/python build-image.py --alpine-mirror= --npm-registry=            # 关国内镜像源，用官方 CDN/registry
 
 默认值单一源（防脚本与仓漂移——勿改为硬编码）：
 - --upstream-version 缺省 = CHANGELOG.md 顶部 `## [X.Y.Z]`（上游 release 即更新，fork rebase 自动跟随）
 - --fork-rev 缺省 = 4（2026-09-29 拍板：固定缺省、人工维护——每次新构建显式 --fork-rev N 递增，
   不做本地镜像史自动推导）
+- --goproxy / --alpine-mirror / --npm-registry 缺省 = 国内源（goproxy.cn / mirrors.aliyun.com /
+  registry.npmmirror.com）。国际 CDN 经本机出口实测 ~10KB/s、国内源直连 4.3MB/s（2026-10-31 实测）；
+  国内源 host 同时进 NO_PROXY 直连，不走企业代理（proxy.wxcount.com:10081）
 
 日志：hatchet/logs/build-image.log（console + 文件双写）。退出码：0 成功；非 0 失败。
 """
@@ -43,6 +47,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ── 根定位 preamble（workspace 各仓脚本统一形态）─────────────────────
 ROOT: Path = Path(__file__).resolve().parents[1]
@@ -54,7 +59,7 @@ require_workspace_venv(ROOT, "hatchet/build-image.py")  # 先于其余 wxinfra i
 
 from wxinfra.base.logging import setup as log_setup  # noqa: E402
 from wxinfra.base.process import run  # noqa: E402
-from wxinfra.base.proxy import with_proxy  # noqa: E402
+from wxinfra.base.proxy import no_proxy_defaults, with_proxy  # noqa: E402
 
 REPO_ROOT: Path = Path(__file__).resolve().parent
 LOGS_DIR: Path = REPO_ROOT / "logs"
@@ -95,6 +100,18 @@ def parse_args() -> argparse.Namespace:
         default="https://goproxy.cn,direct",
         help="Go module proxy（servers.dockerfile GOPROXY build-arg；传空串则不传该 ARG）",
     )
+    parser.add_argument(
+        "--alpine-mirror",
+        default="https://mirrors.aliyun.com",
+        help="Alpine apk 镜像源（servers/lite dockerfile ALPINE_MIRROR build-arg；传空串则不传该 ARG，用官方 CDN）。"
+        "国内源直连实测 4.3MB/s，国际 CDN ~10KB/s（相差 ~430x）——默认国内源",
+    )
+    parser.add_argument(
+        "--npm-registry",
+        default="https://registry.npmmirror.com",
+        help="npm registry 镜像源（servers/lite dockerfile NPM_REGISTRY build-arg；传空串则不传该 ARG，用官方 registry）。"
+        "国内源直连远快于国际 registry——默认国内源",
+    )
     parser.add_argument("--push", action="store_true", help="构建后推送组合镜像到 registry")
     return parser.parse_args()
 
@@ -129,11 +146,56 @@ def default_upstream_version() -> str:
 
 
 def docker_build(*, tag: str, dockerfile: str, build_args: list[str]) -> None:
-    """单步 docker build（经 with_proxy 注入代理三键；失败经 run(check=True) fail-fast）。"""
+    """单步 docker build（经 with_proxy 注入代理三键；失败经 run(check=True) fail-fast）。
+
+    超时 3h：冷缓存构建下 apk 装包层经代理实测 ~7KB/s（单层 27 分钟），
+    Go 全仓编译另需 10-20 分钟——1h 护栏会在第一个中间镜像中途到期
+    （2026-10-30 wx.7 构建实证 TimeoutExpired）。
+    """
     cmd: list[str] = ["docker", "build", "-f", dockerfile, "-t", tag]
     cmd += build_args
     cmd.append(".")
-    with_proxy(cmd, proc_name=f"docker-build-{tag}", cwd=REPO_ROOT, timeout=3600)
+    with_proxy(cmd, proc_name=f"docker-build-{tag}", cwd=REPO_ROOT, timeout=10800)
+
+
+def domestic_mirror_args(args: argparse.Namespace) -> list[str]:
+    """国内镜像源 build-args（apk / npm / NO_PROXY）。
+
+    国内源必须**直连**：国际 CDN 经本机出口实测 ~10KB/s（dl-cdn.alpinelinux.org
+    20s 仅下 199KB），mirrors.aliyun.com 直连 4.3MB/s（2026-10-31 实测，~430x）。
+    企业代理（proxy.wxcount.com:10081）对国内源只有绕行开销，故把这些 host 显式
+    加进 NO_PROXY（大小写都传——apk/libfetch 认小写、Go/curl 认大写），让 RUN 步骤
+    直连镜像站。镜像站本身也追加阿里云 CDN 域（apk 可能 302 过去）。
+    """
+    out: list[str] = []
+    direct_hosts: list[str] = []
+
+    if args.alpine_mirror:
+        out += ["--build-arg", f"ALPINE_MIRROR={args.alpine_mirror}"]
+        host: str | None = urlparse(args.alpine_mirror).hostname
+        if host:
+            direct_hosts += [host, "mirrors.cloud.aliyuncs.com"]
+    if args.npm_registry:
+        out += ["--build-arg", f"NPM_REGISTRY={args.npm_registry}"]
+        host = urlparse(args.npm_registry).hostname
+        if host:
+            direct_hosts.append(host)
+    if args.goproxy:
+        # GOPROXY 形如 "https://goproxy.cn,direct"——取首个 URL 的 host
+        first: str = args.goproxy.split(",")[0]
+        host = urlparse(first).hostname
+        if host:
+            direct_hosts.append(host)
+
+    if not direct_hosts:
+        return out
+
+    no_proxy: str = no_proxy_defaults()
+    for host in direct_hosts:
+        if host not in no_proxy:
+            no_proxy = f"{no_proxy},{host}"
+    out += ["--build-arg", f"NO_PROXY={no_proxy}", "--build-arg", f"no_proxy={no_proxy}"]
+    return out
 
 
 def main() -> int:
@@ -150,6 +212,7 @@ def main() -> int:
     tag: str = f"{version}-wx.{fork_rev}"
     combo_image: str = f"{args.registry}/hatchet-lite:{tag}"
     goproxy_args: list[str] = ["--build-arg", f"GOPROXY={args.goproxy}"] if args.goproxy else []
+    mirror_args: list[str] = domestic_mirror_args(args)
 
     log_setup("build-image", LOGS_DIR)
     print(
@@ -180,6 +243,7 @@ def main() -> int:
                 "--build-arg",
                 f"VERSION={version}",
                 *goproxy_args,
+                *mirror_args,
             ],
         )
 
@@ -195,6 +259,7 @@ def main() -> int:
             f"HATCHET_ADMIN_IMAGE=hatchet-admin-go:{tag}",
             "--build-arg",
             f"HATCHET_MIGRATE_IMAGE=hatchet-migrate-go:{tag}",
+            *mirror_args,
         ],
     )
 
@@ -237,9 +302,11 @@ def main() -> int:
         print(f"[build-image] ✓ pushed：{digest}")
         print(
             "[build-image] .env 同步清单（HATCHET_IMAGE 单一源 code/.env，手工逐字符更新）：\n"
-            "  - code/.env\n"
-            "  - kailash/deploy/.env\n"
-            "  - deploy/.env.e2e（qc e2e 栈共享键）"
+            "  - code/.env（单一源）\n"
+            "  - kailash/.env（kailash UT/IT Testcontainers）\n"
+            "  - kailash/e2e/stack/.env（kailash 本地/CI e2e 栈）\n"
+            "  - qc/e2e/.env.stack（qc e2e 栈）\n"
+            "  - 远端部署仓 .env（/data1/kailash，栈切换由人工执行）"
         )
     else:
         print("[build-image] 未推送（--push 才推送；推送策略与时机归用户）")

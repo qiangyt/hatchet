@@ -400,7 +400,8 @@ func TestConcurrency_SharedStrategy_StaleSweep(t *testing.T) {
 		_, err := conf.Pool.Exec(ctx, "UPDATE v1_tenant_concurrency SET last_active_at = NOW() - INTERVAL '26 hours' WHERE id = $1", s.strategy.ID)
 		require.NoError(t, err)
 
-		err = s.repo.DeactivateStaleStepConcurrency(ctx, s.tenantId)
+		// The 25h threshold here is the engine default; last_active_at was backdated past it.
+		err = s.repo.DeactivateStaleStepConcurrency(ctx, s.tenantId, 25*time.Hour)
 		require.NoError(t, err)
 
 		tenantStrategies, err := queries.ListActiveTenantConcurrencyStrategies(ctx, conf.Pool, s.tenantId)

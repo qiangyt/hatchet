@@ -11,7 +11,12 @@ ENV CGO_ENABLED=0
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
 
-RUN apk update && apk add --no-cache git protoc protobuf-dev
+# Optional Alpine mirror override for the same reason (empty = official CDN).
+ARG ALPINE_MIRROR=""
+RUN if [ -n "$ALPINE_MIRROR" ]; then \
+    sed -i -e "s|https://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" -e "s|http://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" /etc/apk/repositories; \
+    fi && \
+    apk update && apk add --no-cache git protoc protobuf-dev
 
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
 RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
@@ -39,7 +44,11 @@ WORKDIR /openapi
 COPY /api-contracts/openapi ./openapi
 COPY /hack/oas/bundle-openapi.mjs ./bundle-openapi.mjs
 
-RUN echo '{ "type": "module", "dependencies": { "@redocly/openapi-core": "2.14.7", "yaml": "2.7.0" }, "overrides": { "@redocly/ajv": "8.18.1" } }' > package.json && \
+# Optional npm registry override for networks that cannot reach
+# registry.npmjs.org directly (empty = official registry).
+ARG NPM_REGISTRY=""
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
+    echo '{ "type": "module", "dependencies": { "@redocly/openapi-core": "2.14.7", "yaml": "2.7.0" }, "overrides": { "@redocly/ajv": "8.18.1" } }' > package.json && \
     npm install && \
     node bundle-openapi.mjs && \
     rm -f package.json package-lock.json bundle-openapi.mjs
@@ -94,8 +103,14 @@ ENV SERVER_TARGET=${SERVER_TARGET}
 
 WORKDIR /hatchet
 
+# Optional Alpine mirror override (empty = official CDN).
+ARG ALPINE_MIRROR=""
+
 # openssl and bash needed for admin build
-RUN apk update && apk add --no-cache openssl bash ca-certificates tzdata
+RUN if [ -n "$ALPINE_MIRROR" ]; then \
+    sed -i -e "s|https://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" -e "s|http://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" /etc/apk/repositories; \
+    fi && \
+    apk update && apk add --no-cache openssl bash ca-certificates tzdata
 
 COPY --from=build-go /hatchet/bin/hatchet-${SERVER_TARGET} /hatchet/
 

@@ -57,6 +57,13 @@ type ServerConfigFile struct {
 
 	EnableWorkerRetention bool `mapstructure:"enableWorkerRetention" json:"enableWorkerRetention,omitempty" default:"false"`
 
+	// StaleConcurrencyDeactivationThreshold is how long a slotless concurrency
+	// strategy (step-scoped or tenant-scoped) must be idle before the engine
+	// deactivates it. The default 25h covers a 24h idle window plus the 1-hour
+	// last_active_at refresh cache; values must exceed that cache to cover the
+	// intended idle window.
+	StaleConcurrencyDeactivationThreshold time.Duration `mapstructure:"staleConcurrencyDeactivationThreshold" json:"staleConcurrencyDeactivationThreshold,omitempty" default:"25h"`
+
 	EnableSoftDeleteTenantReap bool `mapstructure:"enableSoftDeleteTenantReap" json:"enableSoftDeleteTenantReap,omitempty" default:"false"`
 
 	SoftDeleteTenantReapGracePeriod string `mapstructure:"softDeleteTenantReapGracePeriod" json:"softDeleteTenantReapGracePeriod,omitempty" default:"720h"`
@@ -775,6 +782,12 @@ type ServerConfig struct {
 
 	EnableWorkerRetention bool
 
+	// StaleConcurrencyDeactivationThreshold is how long a slotless concurrency
+	// strategy (step-scoped or tenant-scoped) must be idle before the engine
+	// deactivates it; see ServerConfigFile.StaleConcurrencyDeactivationThreshold
+	// for the constraints on the value.
+	StaleConcurrencyDeactivationThreshold time.Duration
+
 	EnableSoftDeleteTenantReap bool
 
 	SoftDeleteTenantReapGracePeriod string
@@ -883,6 +896,7 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("pausedControllers", "SERVER_PAUSED_CONTROLLERS")
 	_ = v.BindEnv("enableDataRetention", "SERVER_ENABLE_DATA_RETENTION")
 	_ = v.BindEnv("enableWorkerRetention", "SERVER_ENABLE_WORKER_RETENTION")
+	_ = v.BindEnv("staleConcurrencyDeactivationThreshold", "SERVER_STALE_CONCURRENCY_DEACTIVATION_THRESHOLD")
 	_ = v.BindEnv("enableSoftDeleteTenantReap", "SERVER_ENABLE_SOFT_DELETE_TENANT_REAP")
 	_ = v.BindEnv("softDeleteTenantReapGracePeriod", "SERVER_SOFT_DELETE_TENANT_REAP_GRACE_PERIOD")
 	_ = v.BindEnv("softDeleteTenantReapInterval", "SERVER_SOFT_DELETE_TENANT_REAP_INTERVAL")

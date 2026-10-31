@@ -271,6 +271,7 @@ func runV0Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.
 			task.WithQueueLoggerConfig(&sc.AdditionalLoggers.Queue),
 			task.WithPgxStatsLoggerConfig(&sc.AdditionalLoggers.PgxStats),
 			task.WithAnalyzeCronInterval(sc.CronOperations.TaskAnalyzeCronInterval),
+			task.WithStaleConcurrencyThreshold(sc.StaleConcurrencyDeactivationThreshold),
 			task.WithPrometheusGate(sc.PrometheusGate),
 		)
 
@@ -713,6 +714,7 @@ func runV1Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.
 				task.WithOpsPoolJitter(sc.Operations),
 				task.WithReplayEnabled(sc.Runtime.ReplayEnabled),
 				task.WithAnalyzeCronInterval(sc.CronOperations.TaskAnalyzeCronInterval),
+				task.WithStaleConcurrencyThreshold(sc.StaleConcurrencyDeactivationThreshold),
 				task.WithPrometheusGate(sc.PrometheusGate),
 			)
 

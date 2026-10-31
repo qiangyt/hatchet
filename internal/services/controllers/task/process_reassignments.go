@@ -106,5 +106,36 @@ func (tc *TasksControllerImpl) processTaskReassignments(ctx context.Context, ten
 		return false, fmt.Errorf("could not process fail tasks response: %w", err)
 	}
 
+	// The second tier of the reassignment pass releases the desired-worker
+	// affinity of queued tasks whose desired worker is gone (no heartbeat,
+	// listener deactivated, or paused). Those tasks were never assigned, so
+	// they have no runtime row and cannot go through the retry path above;
+	// without the release they would sit in the queue forever under a
+	// sticky=HARD strategy. Report each release to OLAP.
+	for _, task := range res.ClearedDesiredWorkerTasks {
+		olapMsg, err := tasktypes.MonitoringEventMessageFromInternal(
+			tenantIdUUID,
+			tasktypes.CreateMonitoringEventPayload{
+				TaskId:         task.ID,
+				RetryCount:     task.RetryCount,
+				EventType:      sqlcv1.V1EventTypeOlapREASSIGNED,
+				EventTimestamp: time.Now(),
+				EventMessage:   "Task's desired worker is no longer connected; cleared worker affinity so the task can be picked up by another worker",
+			},
+		)
+
+		if err != nil {
+			tc.l.Error().Ctx(ctx).Err(err).Msg("could not create monitoring event message")
+			continue
+		}
+
+		err = tc.pubBuffer.Pub(ctx, msgqueue.OLAP_QUEUE, olapMsg, false)
+
+		if err != nil {
+			tc.l.Error().Ctx(ctx).Err(err).Msg("could not create monitoring event message")
+			continue
+		}
+	}
+
 	return shouldContinue, nil
 }
