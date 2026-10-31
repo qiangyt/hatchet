@@ -174,6 +174,123 @@ func (q *Queries) CleanupWorkflowConcurrencySlotsAfterInsert(ctx context.Context
 	return err
 }
 
+const clearDesiredWorkerIdsForDisconnectedWorkers = `-- name: ClearDesiredWorkerIdsForDisconnectedWorkers :many
+WITH stale_queue_items AS (
+    SELECT
+        qi.task_id,
+        qi.task_inserted_at,
+        qi.retry_count
+    FROM
+        v1_queue_item qi
+    JOIN
+        "Worker" w ON w."id" = qi.desired_worker_id
+    WHERE
+        qi.tenant_id = $1::uuid
+        AND w."tenantId" = $1::uuid
+        AND (
+            w."lastHeartbeatAt" < NOW() - INTERVAL '30 seconds'
+            OR w."isActive" = false
+            OR w."isPaused" = true
+        )
+    LIMIT
+        COALESCE($2::integer, 1000)
+    FOR UPDATE OF qi SKIP LOCKED
+), cleared_queue_items AS (
+    UPDATE
+        v1_queue_item qi
+    SET
+        desired_worker_id = NULL
+    FROM
+        stale_queue_items s
+    WHERE
+        (qi.task_id, qi.task_inserted_at, qi.retry_count) = (s.task_id, s.task_inserted_at, s.retry_count)
+    RETURNING
+        qi.task_id,
+        qi.task_inserted_at,
+        qi.retry_count
+), cleared_tasks AS (
+    UPDATE
+        v1_task t
+    SET
+        desired_worker_id = NULL
+    FROM
+        cleared_queue_items c
+    WHERE
+        (t.id, t.inserted_at, t.retry_count) = (c.task_id, c.task_inserted_at, c.retry_count)
+    RETURNING
+        t.id,
+        t.inserted_at,
+        t.retry_count
+)
+SELECT
+    id,
+    inserted_at,
+    retry_count
+FROM
+    cleared_tasks
+`
+
+type ClearDesiredWorkerIdsForDisconnectedWorkersParams struct {
+	Tenantid uuid.UUID   `json:"tenantid"`
+	Limit    pgtype.Int4 `json:"limit"`
+}
+
+type ClearDesiredWorkerIdsForDisconnectedWorkersRow struct {
+	ID         int64              `json:"id"`
+	InsertedAt pgtype.Timestamptz `json:"inserted_at"`
+	RetryCount int32              `json:"retry_count"`
+}
+
+// Second tier of the reassignment pass. A task whose desired worker has gone
+// away but which was never assigned has no v1_task_runtime row, so
+// ListTasksToReassign can never see it: with sticky=HARD the scheduler ranks
+// every other worker out (scheduler.rankWorkerIds skips candidates whose id
+// differs from a non-nil desired worker), and the task sits in the queue
+// forever. This query releases that affinity.
+//
+// Disconnection mirrors the definitions already used elsewhere:
+//   - lastHeartbeatAt older than 30 seconds — same cutoff as
+//     ListTasksToReassign above;
+//   - isActive = false — set when a listener stream closes (graceful
+//     disconnect, dispatcher deactivateWorkerListener);
+//   - isPaused = true — the other two liveness conditions of ListActiveWorkers
+//     (lease.sql), which defines the worker set the scheduler can assign to.
+//
+// Both tables must be cleared in the same statement: the scheduler reads
+// v1_queue_item.desired_worker_id, while v1_task_update_trigger copies
+// v1_task.desired_worker_id into every queue item it creates on retry — so
+// clearing only the task row would leave the queued item stuck, and clearing
+// only the queue item would let the next retry re-copy the dead affinity. The
+// sticky strategy is deliberately left alone: with a nil desired worker the
+// HARD branch no longer excludes other workers, which is exactly the intended
+// behavior.
+//
+// The scan is tenant-driven on purpose. v1_queue_item has no index on
+// desired_worker_id (only the (tenant_id, queue, priority, id) list index and
+// the task-triple unique index), and the number of disconnected workers per
+// tenant is unbounded on shared instances, so a worker-side join would have to
+// walk every queue item. Filtering the queue item by tenant_id first uses the
+// list index, and the Worker side is a primary-key probe per candidate item.
+func (q *Queries) ClearDesiredWorkerIdsForDisconnectedWorkers(ctx context.Context, db DBTX, arg ClearDesiredWorkerIdsForDisconnectedWorkersParams) ([]*ClearDesiredWorkerIdsForDisconnectedWorkersRow, error) {
+	rows, err := db.Query(ctx, clearDesiredWorkerIdsForDisconnectedWorkers, arg.Tenantid, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*ClearDesiredWorkerIdsForDisconnectedWorkersRow
+	for rows.Next() {
+		var i ClearDesiredWorkerIdsForDisconnectedWorkersRow
+		if err := rows.Scan(&i.ID, &i.InsertedAt, &i.RetryCount); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countActiveTaskBatchRuns = `-- name: CountActiveTaskBatchRuns :one
 SELECT
     COUNT(DISTINCT br.batch_id)::integer AS active_count

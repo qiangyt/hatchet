@@ -226,6 +226,13 @@ type FailTasksResponse struct {
 	*FinalizedTaskResponse
 
 	RetriedTasks []RetriedTask
+
+	// ClearedDesiredWorkerTasks lists tasks whose desired-worker affinity was
+	// released by the reassignment pass because the desired worker is no
+	// longer connected (no heartbeat, listener deactivated, or paused). These
+	// tasks keep their place in the queue and their retry count; only the
+	// affinity is gone, so any worker can pick them up.
+	ClearedDesiredWorkerTasks []*sqlcv1.ClearDesiredWorkerIdsForDisconnectedWorkersRow
 }
 
 type TimeoutTasksResponse struct {
@@ -1556,6 +1563,8 @@ func (r *TaskRepositoryImpl) ProcessTaskReassignments(ctx context.Context, tenan
 
 	limit := r.reassignLimit
 
+	// First tier: tasks parked on a worker that stopped heartbeating are failed
+	// internally, which retries them (or fails them once retries run out).
 	toReassign, err := r.queries.ListTasksToReassign(ctx, tx, sqlcv1.ListTasksToReassignParams{
 		Tenantid: tenantId,
 		Limit: pgtype.Int4{
@@ -1568,44 +1577,69 @@ func (r *TaskRepositoryImpl) ProcessTaskReassignments(ctx context.Context, tenan
 		return nil, false, err
 	}
 
-	if len(toReassign) == 0 {
-		return &FailTasksResponse{
-			FinalizedTaskResponse: &FinalizedTaskResponse{
-				ReleasedTasks:  make([]*sqlcv1.ReleaseTasksRow, 0),
-				InternalEvents: make([]InternalTaskEvent, 0),
-			},
-			RetriedTasks: make([]RetriedTask, 0),
-		}, false, nil
+	res := &FailTasksResponse{
+		FinalizedTaskResponse: &FinalizedTaskResponse{
+			ReleasedTasks:  make([]*sqlcv1.ReleaseTasksRow, 0),
+			InternalEvents: make([]InternalTaskEvent, 0),
+		},
+		RetriedTasks:              make([]RetriedTask, 0),
+		ClearedDesiredWorkerTasks: make([]*sqlcv1.ClearDesiredWorkerIdsForDisconnectedWorkersRow, 0),
 	}
 
-	// parse into FailTaskOpts
-	failOpts := make([]FailTaskOpts, 0, len(toReassign))
+	shouldContinue := len(toReassign) == limit
 
-	for _, task := range toReassign {
-		failOpts = append(failOpts, FailTaskOpts{
-			TaskIdInsertedAtRetryCount: &TaskIdInsertedAtRetryCount{
-				Id:         task.ID,
-				InsertedAt: task.InsertedAt,
-				RetryCount: task.RetryCount,
-			},
-			IsAppError:     false,
-			IsNonRetryable: false,
-		})
+	if len(toReassign) > 0 {
+		// parse into FailTaskOpts
+		failOpts := make([]FailTaskOpts, 0, len(toReassign))
+
+		for _, task := range toReassign {
+			failOpts = append(failOpts, FailTaskOpts{
+				TaskIdInsertedAtRetryCount: &TaskIdInsertedAtRetryCount{
+					Id:         task.ID,
+					InsertedAt: task.InsertedAt,
+					RetryCount: task.RetryCount,
+				},
+				IsAppError:     false,
+				IsNonRetryable: false,
+			})
+		}
+
+		// fail the tasks
+		failRes, err := r.failTasksTx(ctx, tx, tenantId, failOpts)
+
+		if err != nil {
+			return nil, false, err
+		}
+
+		res = failRes
 	}
 
-	// fail the tasks
-	res, err := r.failTasksTx(ctx, tx, tenantId, failOpts)
+	// Second tier: tasks that were never assigned have no runtime row, so the
+	// first tier cannot see them even when their desired worker is gone. Their
+	// affinity is released here instead, in the same transaction — after the
+	// retries above, so the queue items those retries just requeued (which copy
+	// the dead affinity from v1_task) are covered as well.
+	cleared, err := r.queries.ClearDesiredWorkerIdsForDisconnectedWorkers(ctx, tx, sqlcv1.ClearDesiredWorkerIdsForDisconnectedWorkersParams{
+		Tenantid: tenantId,
+		Limit: pgtype.Int4{
+			Int32: int32(limit), // #nosec G115 -- internal engine-configured limit, not attacker-controlled
+			Valid: true,
+		},
+	})
 
 	if err != nil {
 		return nil, false, err
 	}
+
+	res.ClearedDesiredWorkerTasks = cleared
+	shouldContinue = shouldContinue || len(cleared) == limit
 
 	// commit the transaction
 	if err := commit(ctx); err != nil {
 		return nil, false, err
 	}
 
-	return res, len(toReassign) == limit, nil
+	return res, shouldContinue, nil
 }
 
 func (r *TaskRepositoryImpl) ExpirePausedWorkflowQueueItems(ctx context.Context, tenantId uuid.UUID) (*FinalizedTaskResponse, bool, error) {
