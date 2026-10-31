@@ -635,7 +635,8 @@ func TestConcurrency_ColdStrategyScheduledPromptly(t *testing.T) {
 
 		// Make the strategy "cold": with no slots yet, the stale-deactivation sweep flips it to
 		// is_active=FALSE. This mirrors a strategy that has been idle for the deactivation window.
-		require.NoError(t, concurrencyRepo.DeactivateStaleStepConcurrency(ctx, tenantId))
+		// The 25h threshold here is the engine default.
+		require.NoError(t, concurrencyRepo.DeactivateStaleStepConcurrency(ctx, tenantId, 25*time.Hour))
 
 		activeAfterDeactivate, err := queries.ListActiveConcurrencyStrategies(ctx, conf.Pool, tenantId)
 		require.NoError(t, err)

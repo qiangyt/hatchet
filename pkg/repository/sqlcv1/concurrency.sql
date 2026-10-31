@@ -1307,13 +1307,17 @@ GROUP BY tenant_id
 HAVING COUNT(*) > @threshold::BIGINT;
 
 -- name: DeactivateStaleStepConcurrency :exec
+-- The threshold must exceed the 1-hour last_active_at refresh cache (the
+-- slot-insert trigger bumps last_active_at at most once per hour), so it
+-- always covers the intended idle window. It is injected by the caller
+-- (engine default 25h = 24h idle + 1h cache; configurable via
+-- SERVER_STALE_CONCURRENCY_DEACTIVATION_THRESHOLD).
 WITH tenant_step_concurrencies AS (
     SELECT sc.id
     FROM v1_step_concurrency sc
     WHERE sc.tenant_id = @tenantId::UUID
         AND sc.is_active = TRUE
-        -- we use 25 hours because there's a 1-hour cache on updating last_active_at
-        AND sc.last_active_at < NOW() - INTERVAL '25 hours'
+        AND sc.last_active_at < NOW() - make_interval(secs => @thresholdSeconds::BIGINT)
         AND NOT EXISTS (
             SELECT 1 FROM v1_concurrency_slot cs
             WHERE

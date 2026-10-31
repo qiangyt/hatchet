@@ -132,8 +132,7 @@ WITH tenant_step_concurrencies AS (
     FROM v1_step_concurrency sc
     WHERE sc.tenant_id = $1::UUID
         AND sc.is_active = TRUE
-        -- we use 25 hours because there's a 1-hour cache on updating last_active_at
-        AND sc.last_active_at < NOW() - INTERVAL '25 hours'
+        AND sc.last_active_at < NOW() - make_interval(secs => $2::BIGINT)
         AND NOT EXISTS (
             SELECT 1 FROM v1_concurrency_slot cs
             WHERE
@@ -156,8 +155,18 @@ FROM tenant_step_concurrencies
 WHERE sc.id = tenant_step_concurrencies.id
 `
 
-func (q *Queries) DeactivateStaleStepConcurrency(ctx context.Context, db DBTX, tenantid uuid.UUID) error {
-	_, err := db.Exec(ctx, deactivateStaleStepConcurrency, tenantid)
+type DeactivateStaleStepConcurrencyParams struct {
+	Tenantid         uuid.UUID `json:"tenantid"`
+	Thresholdseconds int64     `json:"thresholdseconds"`
+}
+
+// The threshold must exceed the 1-hour last_active_at refresh cache (the
+// slot-insert trigger bumps last_active_at at most once per hour), so it
+// always covers the intended idle window. It is injected by the caller
+// (engine default 25h = 24h idle + 1h cache; configurable via
+// SERVER_STALE_CONCURRENCY_DEACTIVATION_THRESHOLD).
+func (q *Queries) DeactivateStaleStepConcurrency(ctx context.Context, db DBTX, arg DeactivateStaleStepConcurrencyParams) error {
+	_, err := db.Exec(ctx, deactivateStaleStepConcurrency, arg.Tenantid, arg.Thresholdseconds)
 	return err
 }
 

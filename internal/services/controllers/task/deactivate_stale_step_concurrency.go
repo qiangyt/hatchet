@@ -15,7 +15,7 @@ func (tc *TasksControllerImpl) deactivateStaleStepConcurrency(ctx context.Contex
 
 	telemetry.WithAttributes(span, telemetry.AttributeKV{Key: "tenant.id", Value: tenantId})
 
-	if err := tc.repov1.Scheduler().Concurrency().DeactivateStaleStepConcurrency(ctx, uuid.MustParse(tenantId)); err != nil {
+	if err := tc.repov1.Scheduler().Concurrency().DeactivateStaleStepConcurrency(ctx, uuid.MustParse(tenantId), tc.staleConcurrencyThreshold); err != nil {
 		return false, fmt.Errorf("failed to deactivate stale step concurrency for tenant %s: %w", tenantId, err)
 	}
 

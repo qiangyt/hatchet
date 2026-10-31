@@ -66,28 +66,33 @@ type TasksControllerImpl struct {
 
 	replayEnabled       bool
 	analyzeCronInterval time.Duration
-	signaler            *signal.OLAPSignaler
-	tw                  *trigger.TriggerWriter
-	promGate            *prometheus.Gate
+	// strategies idle longer than this (and holding no slots) are deactivated
+	// by the deactivate-stale-step-concurrency pool; must exceed the 1-hour
+	// last_active_at refresh cache
+	staleConcurrencyThreshold time.Duration
+	signaler                  *signal.OLAPSignaler
+	tw                        *trigger.TriggerWriter
+	promGate                  *prometheus.Gate
 }
 
 type TasksControllerOpt func(*TasksControllerOpts)
 
 type TasksControllerOpts struct {
-	mq                  msgqueue.MessageQueue
-	pubsub              msgqueue.PubSub
-	l                   *zerolog.Logger
-	repov1              v1.Repository
-	dv                  datautils.DataDecoderValidator
-	alerter             hatcheterrors.Alerter
-	p                   *partition.Partition
-	queueLogger         *zerolog.Logger
-	pgxStatsLogger      *zerolog.Logger
-	opsPoolJitter       time.Duration
-	opsPoolPollInterval time.Duration
-	replayEnabled       bool
-	analyzeCronInterval time.Duration
-	promGate            *prometheus.Gate
+	mq                        msgqueue.MessageQueue
+	pubsub                    msgqueue.PubSub
+	l                         *zerolog.Logger
+	repov1                    v1.Repository
+	dv                        datautils.DataDecoderValidator
+	alerter                   hatcheterrors.Alerter
+	p                         *partition.Partition
+	queueLogger               *zerolog.Logger
+	pgxStatsLogger            *zerolog.Logger
+	opsPoolJitter             time.Duration
+	opsPoolPollInterval       time.Duration
+	replayEnabled             bool
+	analyzeCronInterval       time.Duration
+	staleConcurrencyThreshold time.Duration
+	promGate                  *prometheus.Gate
 }
 
 func defaultTasksControllerOpts() *TasksControllerOpts {
@@ -107,6 +112,9 @@ func defaultTasksControllerOpts() *TasksControllerOpts {
 		opsPoolPollInterval: 2 * time.Second,
 		replayEnabled:       true, // default to enabled for backward compatibility
 		analyzeCronInterval: 3 * time.Hour,
+		// 25h = a 24h idle window plus the 1-hour last_active_at refresh cache
+		// (the slot-insert trigger bumps last_active_at at most once per hour)
+		staleConcurrencyThreshold: 25 * time.Hour,
 	}
 }
 
@@ -185,6 +193,15 @@ func WithAnalyzeCronInterval(interval time.Duration) TasksControllerOpt {
 	}
 }
 
+// WithStaleConcurrencyThreshold sets the idleness threshold after which a
+// slotless concurrency strategy is deactivated. Values must exceed the 1-hour
+// last_active_at refresh cache to cover the intended idle window.
+func WithStaleConcurrencyThreshold(threshold time.Duration) TasksControllerOpt {
+	return func(opts *TasksControllerOpts) {
+		opts.staleConcurrencyThreshold = threshold
+	}
+}
+
 func WithPrometheusGate(gate *prometheus.Gate) TasksControllerOpt {
 	return func(opts *TasksControllerOpts) {
 		opts.promGate = gate
@@ -232,25 +249,26 @@ func New(fs ...TasksControllerOpt) (*TasksControllerImpl, error) {
 	tw := trigger.NewTriggerWriter(opts.mq, opts.pubsub, opts.repov1, opts.l, pubBuffer, 0, opts.promGate)
 
 	t := &TasksControllerImpl{
-		mq:                  opts.mq,
-		pubsub:              opts.pubsub,
-		pubBuffer:           pubBuffer,
-		l:                   opts.l,
-		queueLogger:         opts.queueLogger,
-		pgxStatsLogger:      opts.pgxStatsLogger,
-		repov1:              opts.repov1,
-		dv:                  opts.dv,
-		s:                   s,
-		a:                   a,
-		p:                   opts.p,
-		celParser:           cel.NewCELParser(),
-		opsPoolJitter:       opts.opsPoolJitter,
-		opsPoolPollInterval: opts.opsPoolPollInterval,
-		replayEnabled:       opts.replayEnabled,
-		analyzeCronInterval: opts.analyzeCronInterval,
-		signaler:            signaler,
-		tw:                  tw,
-		promGate:            opts.promGate,
+		mq:                        opts.mq,
+		pubsub:                    opts.pubsub,
+		pubBuffer:                 pubBuffer,
+		l:                         opts.l,
+		queueLogger:               opts.queueLogger,
+		pgxStatsLogger:            opts.pgxStatsLogger,
+		repov1:                    opts.repov1,
+		dv:                        opts.dv,
+		s:                         s,
+		a:                         a,
+		p:                         opts.p,
+		celParser:                 cel.NewCELParser(),
+		opsPoolJitter:             opts.opsPoolJitter,
+		opsPoolPollInterval:       opts.opsPoolPollInterval,
+		replayEnabled:             opts.replayEnabled,
+		analyzeCronInterval:       opts.analyzeCronInterval,
+		staleConcurrencyThreshold: opts.staleConcurrencyThreshold,
+		signaler:                  signaler,
+		tw:                        tw,
+		promGate:                  opts.promGate,
 	}
 
 	jitter := t.opsPoolJitter
