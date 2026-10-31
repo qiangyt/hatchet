@@ -15,9 +15,16 @@ FROM node:22-alpine as frontend-build
 
 WORKDIR /app
 
+# Optional npm registry override for networks that cannot reach
+# registry.npmjs.org directly (empty = official registry). corepack fetches
+# the pnpm tarball through COREPACK_NPM_REGISTRY; pnpm itself reads
+# npm_config_registry.
+ARG NPM_REGISTRY=""
 COPY ./frontend/app/package.json ./frontend/app/pnpm-lock.yaml ./
-RUN corepack pnpm@10.16.1 --version
-RUN corepack pnpm@10.16.1 install --frozen-lockfile && corepack pnpm@10.16.1 store prune
+RUN if [ -n "$NPM_REGISTRY" ]; then export COREPACK_NPM_REGISTRY="$NPM_REGISTRY" npm_config_registry="$NPM_REGISTRY"; fi && \
+    corepack pnpm@10.16.1 --version
+RUN if [ -n "$NPM_REGISTRY" ]; then export COREPACK_NPM_REGISTRY="$NPM_REGISTRY" npm_config_registry="$NPM_REGISTRY"; fi && \
+    corepack pnpm@10.16.1 install --frozen-lockfile && corepack pnpm@10.16.1 store prune
 
 COPY ./frontend/app ./
 RUN npm run build
@@ -26,8 +33,14 @@ RUN npm run build
 # TODO： base 镜像应该锁定版本和digest
 FROM alpine AS deployment
 
+# Optional Alpine mirror override (empty = official CDN).
+ARG ALPINE_MIRROR=""
+
 # install bash via apk
-RUN apk update && apk add --no-cache bash openssl ca-certificates curl postgresql-client tzdata
+RUN if [ -n "$ALPINE_MIRROR" ]; then \
+    sed -i -e "s|https://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" -e "s|http://dl-cdn.alpinelinux.org|$ALPINE_MIRROR|g" /etc/apk/repositories; \
+    fi && \
+    apk update && apk add --no-cache bash openssl ca-certificates curl postgresql-client tzdata
 
 COPY --from=lite-binary-base /hatchet/hatchet-lite ./hatchet-lite
 COPY --from=admin-binary-base /hatchet/hatchet-admin ./hatchet-admin
