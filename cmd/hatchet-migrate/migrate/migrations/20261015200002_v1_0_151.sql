@@ -1,4 +1,6 @@
 -- +goose NO TRANSACTION
+-- Fork ordering: keep this migration after 20261015200000 so fork-lineage
+-- databases apply it in the same boot as the engine that requires it.
 -- Runs without a wrapping transaction on purpose: the ALTER TABLE statements below take
 -- ACCESS EXCLUSIVE locks on v1_task and v1_concurrency_slot, which many application
 -- transactions touch together. Acquiring those locks one statement at a time (instead of

@@ -1,4 +1,6 @@
 -- +goose Up
+-- Fork ordering: keep this migration after 20261015200000 so fork-lineage
+-- databases apply it in the same boot as the engine that requires it.
 -- +goose StatementBegin
 ALTER TABLE v1_match SET (
     autovacuum_vacuum_scale_factor = '0.1',

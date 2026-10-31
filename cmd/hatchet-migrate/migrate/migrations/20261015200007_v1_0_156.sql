@@ -1,4 +1,6 @@
 -- +goose NO TRANSACTION
+-- Fork ordering: keep this migration after 20261015200000 so fork-lineage
+-- databases apply it in the same boot as the engine that requires it.
 -- Runs without a wrapping transaction so the ALTER TABLE on "Worker" commits, and releases its
 -- lock, before the backfills run. A failure part way through leaves the earlier statements
 -- applied, so the "Worker" statement can be re-run as is.
